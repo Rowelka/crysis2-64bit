@@ -12,6 +12,35 @@ The game is completable start to finish on this launcher (verified by an externa
 
 ---
 
+## Installation
+
+You need **Crysis 2** patched to 1.9 (the Maximum Edition already is) and the **Crysis 2 Mod SDK**.
+The Mod SDK is what puts the 64-bit engine DLLs into the game's `Bin64` folder - without it there
+is nothing here to run.
+
+1. Install Crysis 2, then install the Crysis 2 Mod SDK into the same folder.
+2. Download `launcher64.exe` from the [Releases](https://github.com/Rowelka/crysis2-64bit/releases) page.
+3. Put it in `<game folder>\Bin64\`, next to `CrySystem.dll` and `Editor.exe`.
+4. Run `launcher64.exe`.
+
+Nothing is overwritten and no game file is modified - the original 32-bit `Crysis2.exe` keeps
+working exactly as before. To uninstall, delete `launcher64.exe`.
+
+### If something goes wrong
+
+Every launch writes `launcher_diag.txt` into the game folder, listing your hardware, display mode,
+and the versions of every engine module and pak. Attach that file to a bug report; it usually
+identifies the problem immediately.
+
+Two flags exist if a fix causes trouble on your setup:
+
+| Flag | Effect |
+|---|---|
+| `-noborderless` | leave the window alone, use whatever mode the game picks |
+| `-keepintro` | keep the intro videos and the debug overlay |
+
+---
+
 ## What this fixes
 
 ### 1. The 64 FPS lock - root cause found
@@ -165,12 +194,8 @@ Command line flags:
 | `-noborderless` | leave the window alone, use whatever mode the game picks |
 | `-keepintro` | keep the intro videos and the debug overlay |
 
-## Requirements
-
-You need a legitimate copy of **Crysis 2** and the **Crysis 2 Mod SDK**. This repository contains
-no game files, no engine DLLs and no Crytek headers - only launcher source.
-
 ## Building
+
 
 ```powershell
 # Requires WDK 7.1 (for the VC90 x64 compiler) at C:\WinDDK\7600.16385.1
@@ -179,13 +204,6 @@ no game files, no engine DLLs and no Crytek headers - only launcher source.
 
 `build.ps1` compiles `Main_min.cpp`, embeds the VC90 CRT manifest and copies the result into the
 game's `Bin64`. Adjust the paths at the top of the script to match your install.
-
-## Running
-
-Place `launcher64.exe` in the game's `Bin64` directory (next to the x64 engine DLLs from the Mod
-SDK) and run it.
-
----
 
 ## Known issues
 
