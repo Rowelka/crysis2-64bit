@@ -12,6 +12,14 @@
 #include <string.h>
 #include "cry_min.h"
 
+// Declared locally rather than including psapi.h, to avoid adding a static import - see the
+// note above LoadTimerApi for why the launcher's import list must stay minimal.
+typedef struct _MODULEINFO_LOCAL {
+	LPVOID lpBaseOfDll;
+	DWORD  SizeOfImage;
+	LPVOID EntryPoint;
+} MODULEINFO;
+
 // VC90 CRT side-by-side dependency. /MD adds it as well; stated explicitly to be safe.
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.VC90.CRT' version='9.0.21022.8' processorArchitecture='amd64' publicKeyToken='1fc8b3b9a1e18e3b'\"")
 
@@ -397,6 +405,63 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	if (pGetDpi) {
 		UINT dpi = pGetDpi();
 		if (dpi) DiagLine(f, "DPI scale      : %u%% (%u dpi)", (dpi * 100) / 96, dpi);
+	}
+	DiagLine(f, "");
+
+	// Allocator probe.
+	//
+	// A tester hits "Failed CMTSafeHeap::m_pBigPool allocation" on startup while 19 GB are free.
+	// That message means new[] returned NULL for a pool of at most 14 MB, so the engine's own
+	// allocator is already broken by the time it asks. CrySystem is imported statically, so it
+	// is loaded and its static initialisation has run before any of this code executes - we can
+	// read its state before the engine destroys itself, and repeat the same allocation through
+	// the same CRT it uses.
+	//
+	// Offsets come from reversing this exact build (CrySystem 1.1.1.217); they are checked
+	// against the module size first so a different build simply skips the probe.
+	DiagLine(f, "--- allocator ---");
+	{
+		HMODULE cs = GetModuleHandleA("CrySystem.dll");
+		MODULEINFO mi;
+		memset(&mi, 0, sizeof(mi));
+		bool haveInfo = false;
+		HMODULE psapi = LoadLibraryA("psapi.dll");
+		if (psapi) {
+			typedef BOOL (WINAPI *GetModuleInformationFn)(HANDLE, HMODULE, void*, DWORD);
+			GetModuleInformationFn pGMI = (GetModuleInformationFn)GetProcAddress(psapi, "GetModuleInformation");
+			if (pGMI && cs) haveInfo = (pGMI(GetCurrentProcess(), cs, &mi, sizeof(mi)) != 0);
+		}
+		if (cs && haveInfo && mi.SizeOfImage > 0x700000) {
+			unsigned char* b = (unsigned char*)cs;
+			unsigned long long slab = *(unsigned long long*)(b + 0x6F9338);
+			unsigned long long mallocFn = *(unsigned long long*)(b + 0x6EF6C8);
+			DiagLine(f, "bucket slab    : 0x%016llX %s", slab,
+			         slab == 0 ? "(NULL - allocator never initialised)"
+			                   : (slab < 0x100000000ull ? "(below 4 GB, as expected)"
+			                                            : "(ABOVE 4 GB - pointer truncation applies)"));
+			DiagLine(f, "crt malloc ptr : 0x%016llX", mallocFn);
+		} else {
+			DiagLine(f, "bucket slab    : (skipped - unexpected CrySystem build)");
+		}
+
+		// Repeat the engine's own allocation, through the engine's own CRT. If this fails here,
+		// the problem is the runtime, not the engine.
+		HMODULE m90 = GetModuleHandleA("msvcr90.dll");
+		if (m90) {
+			typedef void* (__cdecl *MallocFn)(size_t);
+			typedef void  (__cdecl *FreeFn)(void*);
+			MallocFn m90malloc = (MallocFn)GetProcAddress(m90, "malloc");
+			FreeFn   m90free   = (FreeFn)GetProcAddress(m90, "free");
+			if (m90malloc && m90free) {
+				void* big = m90malloc(14 * 1024 * 1024);   // the largest pool the engine asks for
+				DiagLine(f, "msvcr90 14MB   : %s (%p)", big ? "OK" : "FAILED - this is the failure itself", big);
+				if (big) m90free(big);
+			} else {
+				DiagLine(f, "msvcr90 14MB   : (malloc/free not found)");
+			}
+		} else {
+			DiagLine(f, "msvcr90        : NOT LOADED - the engine's CRT is missing");
+		}
 	}
 	DiagLine(f, "");
 
