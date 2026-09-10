@@ -23,6 +23,14 @@ $env:LIB     = "$wdk\lib\crt\amd64;$wdk\lib\win7\amd64"
 Set-Location $dir
 if (Test-Path $out) { Remove-Item $out -Force }
 
+# Import library for CrySystem, generated from the .def rather than shipped: it is derived from
+# the game's own DLL, so it is not ours to distribute, and generating it keeps this repository to
+# source only. link /lib does the job; the WDK has no separate lib.exe.
+if (-not (Test-Path "$dir\CrySystem.lib")) {
+    & "$wdk\bin\x86\amd64\link.exe" /lib /nologo /def:"$dir\CrySystem.def" /machine:x64 /out:"$dir\CrySystem.lib"
+    if (-not (Test-Path "$dir\CrySystem.lib")) { throw "FAILED to generate CrySystem.lib from CrySystem.def" }
+}
+
 # Cursor resources: the game calls LoadCursorA against its own executable, which is this
 # launcher. Without them LoadCursorA returns NULL and the in-game cursor is invisible
 # (the mouse still works and menu buttons still highlight). The .cur files are Crytek
