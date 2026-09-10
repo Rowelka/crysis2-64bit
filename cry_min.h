@@ -1,10 +1,14 @@
 #pragma once
-// [x64launcher approach B] Минимальный STL-free интерфейс CryEngine для сборки VC90 (WDK 7.1).
-// WDK-STL (stl70) не компилируется сам по себе (внутр. рассинхрон версий заголовков), а лаунчеру
-// STL и не нужен. Определения скопированы ДОСЛОВНО из retail-заголовков
-// (ISystem.h / IGameStartup.h / IGameRef.h), #ifdef разрешены как в retail-Windows-сборке
-// (без OPEN_AUTOMATE, без LINUX) - layout совпадает с тем, чего ждёт retail CrySystem.dll.
-// В конце добавлен запас _pad[] на случай, если retail-структура чуть больше (лишние поля=0).
+// A minimal, STL-free subset of the CryEngine interfaces, just enough to boot the engine.
+//
+// It exists because this launcher is compiled with the VC90 toolchain from WDK 7.1 (see
+// build.ps1 for why), and that kit's bundled STL does not compile on its own. The launcher
+// does not need STL anyway.
+//
+// The struct layouts must match what retail CrySystem.dll expects, so they are reproduced
+// as the retail Windows build sees them (no OPEN_AUTOMATE, no LINUX). If a retail struct
+// turns out to be slightly larger, the trailing _pad absorbs the difference and the extra
+// fields simply read as zero.
 
 #include <string.h>  // memset
 
@@ -51,11 +55,11 @@ struct SSystemInitParams
 
 	SCvarsDefault	*pCvarsDefault;
 
-	char _pad[512]; // запас на случай доп. retail-полей (читаются как 0)
+	char _pad[512];   // headroom in case retail has more fields; they read as zero
 
 	SSystemInitParams()
 	{
-		memset(this, 0, sizeof(*this)); // все поля 0/false/NULL (как в retail-конструкторе)
+		memset(this, 0, sizeof(*this));   // retail's constructor zeroes everything too
 		bExecuteCommandLine = true;
 	}
 };
@@ -85,5 +89,5 @@ struct IGameStartup
 	virtual int Run( const char * autoStartLevelName ) = 0;
 };
 
-// retail экспортирует undecorated (extern "C"); стат-импорт через CrySystem.lib.
+// Retail exports this undecorated, so it is imported statically through CrySystem.lib.
 extern "C" ISystem* CreateSystemInterface(const SSystemInitParams &startupParams);

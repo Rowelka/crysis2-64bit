@@ -136,6 +136,35 @@ blue, green, red and white Crysis cursors). Those are Crytek assets, so they are
 `extract_cursors.py` pulls them out of the `Crysis2.exe` of the installed game at build time, and
 `build.ps1` runs it automatically.
 
+## How it works
+
+Crysis 2 has no 64-bit game executable, so this one takes the place of `Crysis2.exe` and drives
+the engine directly. At startup it:
+
+1. **Raises the timer resolution** to 1 ms, before anything else, which is what lifts the 64 FPS
+   ceiling described above.
+2. **Sets the working directory** to the game root, so the engine resolves its own paths.
+3. **Appends console commands** to the engine's command line: windowed at desktop resolution for
+   borderless mode, plus skipping the intro and the debug overlay.
+4. **Starts a background thread** that finds the game window and strips its frame, then keeps
+   watching in case the engine recreates the window.
+5. **Writes `launcher_diag.txt`**, before engine init so the file survives a startup crash.
+6. **Creates the engine** through `CreateSystemInterface`, in the same order the editor uses.
+7. **Patches the loaded engine DLLs** in memory: the CryAction release asserts that force-crash
+   on level load, the CryMovie update loop that walks freed entries after a layer unload, and two
+   unimplemented vtable slots in the editor build of CrySystem.
+8. **Loads the game DLL**, calls its entry point, and enters the main loop.
+
+Steps 6 and 7 are ordered deliberately: the patches have to be applied after the modules are
+loaded but before the game initialises and starts using them.
+
+Command line flags:
+
+| Flag | Effect |
+|---|---|
+| `-noborderless` | leave the window alone, use whatever mode the game picks |
+| `-keepintro` | keep the intro videos and the debug overlay |
+
 ## Requirements
 
 You need a legitimate copy of **Crysis 2** and the **Crysis 2 Mod SDK**. This repository contains
