@@ -3,7 +3,7 @@
 A 64-bit game launcher for **Crysis 2**.
 
 Crysis 2 shipped with a 32-bit game executable only. The Crysis 2 Mod SDK, however, ships a
-complete set of **64-bit engine DLLs** — they were built for the Sandbox editor, and no 64-bit
+complete set of **64-bit engine DLLs** - they were built for the Sandbox editor, and no 64-bit
 game client was ever released. This launcher boots those x64 DLLs as a playable game client.
 
 The game is completable start to finish on this launcher (verified by an external tester).
@@ -14,7 +14,7 @@ The game is completable start to finish on this launcher (verified by an externa
 
 ## What this fixes
 
-### 1. The 64 FPS lock — root cause found
+### 1. The 64 FPS lock - root cause found
 
 The x64 build has a hard framerate ceiling at almost exactly 64 FPS. It is not a GPU or CPU
 limit: with the lock active the GPU sits at ~5.6 ms and physics at ~0.1 ms, while the main
@@ -69,7 +69,7 @@ So the launcher runs the game in a **borderless window sized to the screen**: it
 to start windowed at desktop resolution, then a background thread finds the game window and
 strips its frame. The result looks like fullscreen and feels like windowed.
 
-This also fixes Alt-Tab crashes for free — a windowed swapchain has no exclusive device to lose
+This also fixes Alt-Tab crashes for free - a windowed swapchain has no exclusive device to lose
 on a focus switch. Confirmed in practice: Alt-Tab is now fast and returns straight to a
 borderless fullscreen view.
 
@@ -89,7 +89,7 @@ heap low.
 The launcher reproduces that condition on purpose: it is built with the **VC90 compiler from WDK
 7.1** and links `msvcr90` as the primary CRT (`/MD`), so the process heap lands below 4 GB and the
 truncation becomes harmless. This is why `build.ps1` uses the WDK toolchain rather than a modern
-MSVC — it is load-bearing, not legacy.
+MSVC - it is load-bearing, not legacy.
 
 ### 4. Level-load and cutscene crashes
 
@@ -97,7 +97,7 @@ MSVC — it is load-bearing, not legacy.
   build. The launcher patches them out in memory at startup (addresses from c2-launcher).
 - **CMovieSystem use-after-free**: unloading a layer during a cutscene precache leaves dangling
   descriptors in the movie update list, which crash on Battery Park. The launcher installs a
-  vectored exception handler that skips the corrupt entry instead of dying — worst case a broken
+  vectored exception handler that skips the corrupt entry instead of dying - worst case a broken
   node loses its animation.
 
 ---
@@ -105,7 +105,7 @@ MSVC — it is load-bearing, not legacy.
 ## Requirements
 
 You need a legitimate copy of **Crysis 2** and the **Crysis 2 Mod SDK**. This repository contains
-no game files, no engine DLLs and no Crytek headers — only launcher source.
+no game files, no engine DLLs and no Crytek headers - only launcher source.
 
 ## Building
 
@@ -134,9 +134,9 @@ SDK) and run it.
 
 ## Credits
 
-- **[c1-launcher](https://github.com/ccomrade/c1-launcher)** by *ccomrade* — the original
+- **[c1-launcher](https://github.com/ccomrade/c1-launcher)** by *ccomrade* - the original
   open-source Crysis launcher, and the reference that showed this approach is viable.
-- **[c2-launcher](https://github.com/ItsNiklas/c2-launcher)** — the CryAction assert-patch
+- **[c2-launcher](https://github.com/ItsNiklas/c2-launcher)** - the CryAction assert-patch
   addresses used here were taken from that project.
 
 This launcher's source is written from scratch (STL-free, so it can be compiled by the VC90
@@ -144,4 +144,4 @@ toolchain); it is not a fork of either project.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
