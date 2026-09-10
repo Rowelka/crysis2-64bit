@@ -123,6 +123,19 @@ Both are set from the launcher's command line at startup:
 
 Pass `-keepintro` to restore the original behaviour, or set the CVars from the console.
 
+### 6. The invisible cursor
+
+The game loads its cursor with `LoadCursorA` against the running executable, which with this
+project is the launcher rather than `Crysis2.exe`. The original executable carries those cursor
+resources; a launcher built without them makes `LoadCursorA` return NULL, and the cursor
+disappears. The mouse still works: menu buttons highlight on hover, clicks land where they should,
+but nothing is drawn under the pointer.
+
+The launcher links the same resources under the same ids the game asks for (103-107, the amber,
+blue, green, red and white Crysis cursors). Those are Crytek assets, so they are not stored here.
+`extract_cursors.py` pulls them out of the `Crysis2.exe` of the installed game at build time, and
+`build.ps1` runs it automatically.
+
 ## Requirements
 
 You need a legitimate copy of **Crysis 2** and the **Crysis 2 Mod SDK**. This repository contains

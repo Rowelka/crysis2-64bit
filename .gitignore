@@ -1,8 +1,8 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# WHITELIST: игнорируем ВСЁ, затем явно разрешаем только собственные файлы.
-# Так проприетарные файлы Crytek (StdAfx.h, CryMemoryManager_impl.h), бинарники
-# Crysis 2 и артефакты сборки физически не могут попасть в репозиторий.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# WHITELIST: ignore everything, then allow only our own files. This makes it
+# impossible for Crytek assets (extracted cursors, SDK headers) or build
+# artifacts to end up in the repository by accident.
+# ---------------------------------------------------------------------------
 *
 !.gitignore
 !README.md
@@ -11,5 +11,8 @@
 !Main_min.cpp
 !cry_min.h
 !CrySystem.def
+!resource.h
+!launcher.rc
+!extract_cursors.py
 !docs/
 !docs/**.md

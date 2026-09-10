@@ -1,0 +1,15 @@
+// [run91] Курсоры Crysis.
+// Игра (CryGameReal.dll) грузит курсор через LoadCursorA у СВОЕГО исполняемого файла, то есть
+// у лаунчера. У оригинального Crysis2.exe эти ресурсы есть, у нашего лаунчера их не было -
+// LoadCursorA возвращал NULL, и курсор становился невидимым: мышь работает, кнопки в меню
+// подсвечиваются при наведении, но самого курсора не видно.
+// ID обязаны совпадать с оригиналом (103-107), их же ждёт игра.
+// .cur файлы не хранятся в репозитории (ресурсы Crytek) - их извлекает extract_cursors.py
+// из Crysis2.exe той копии игры, которая стоит у пользователя.
+#include "resource.h"
+
+IDC_CRYSISCURSOR_AMBER  CURSOR  "res/cursor_103.cur"
+IDC_CRYSISCURSOR_BLUE   CURSOR  "res/cursor_104.cur"
+IDC_CRYSISCURSOR_GREEN  CURSOR  "res/cursor_105.cur"
+IDC_CRYSISCURSOR_RED    CURSOR  "res/cursor_106.cur"
+IDC_CRYSISCURSOR_WHITE  CURSOR  "res/cursor_107.cur"
