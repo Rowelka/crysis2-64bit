@@ -1,18 +1,28 @@
-# ---------------------------------------------------------------------------
-# WHITELIST: ignore everything, then allow only our own files. This makes it
-# impossible for Crytek assets (extracted cursors, SDK headers) or build
-# artifacts to end up in the repository by accident.
-# ---------------------------------------------------------------------------
+# This is a whitelist, not the usual blacklist: everything is ignored, and only
+# our own source files are allowed back in.
+#
+# Why: the build directory sits inside a Crysis 2 installation, so Crytek files
+# (SDK headers, import libraries generated from retail DLLs, cursor resources
+# extracted from Crysis2.exe) live right next to ours. A normal blacklist would
+# let any newly added file slip into a commit unnoticed. Here nothing reaches
+# the repository unless it is listed below.
+#
+# Adding a new source file? Add a matching "!name" line, or git will ignore it.
+#
+# Build artifacts (*.obj, *.exe, *.res, res/*.cur) need no entries of their own:
+# the first line already covers them.
+
 *
+
 !.gitignore
 !README.md
 !LICENSE
 !build.ps1
+!extract_cursors.py
+!launcher.rc
+!resource.h
 !Main_min.cpp
 !cry_min.h
 !CrySystem.def
-!resource.h
-!launcher.rc
-!extract_cursors.py
 !docs/
 !docs/**.md
