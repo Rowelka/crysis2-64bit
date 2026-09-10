@@ -38,7 +38,7 @@ if (Test-Path "$dir\res\cursor_103.cur") {
 
 $res = ""
 if (Test-Path "$dir\launcher.res") { $res = "$dir\launcher.res" }
-& $cl /nologo /EHsc /MD /DWIN64 /D_WIN64 /I. Main_min.cpp /Fe"$out" /Fo"$dir\Main_min.obj" /link CrySystem.lib kernel32.lib user32.lib shell32.lib winmm.lib gdi32.lib $res /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST
+& $cl /nologo /EHsc /MD /DWIN64 /D_WIN64 /I. Main_min.cpp /Fe"$out" /Fo"$dir\Main_min.obj" /link CrySystem.lib kernel32.lib user32.lib shell32.lib  $res /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST
 if (-not (Test-Path $out)) { throw "BUILD FAILED: $out not created" }
 
 # Embed manifest (VC90.CRT dependency).

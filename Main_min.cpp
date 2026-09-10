@@ -176,8 +176,24 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 // pay a whole quantum.
 //
 // Since Windows 10 2004 the call is per-process, so this affects only the game.
-extern "C" __declspec(dllimport) unsigned __stdcall timeBeginPeriod(unsigned uPeriod);
-extern "C" __declspec(dllimport) unsigned __stdcall timeEndPeriod(unsigned uPeriod);
+// WINMM is loaded at runtime rather than imported statically, and this is load-bearing.
+// A static import is resolved by the loader before any of our code runs, pulling WINMM and its
+// dependencies in ahead of the CRT and shifting the process address space. That defeats the whole
+// point of building against msvcr90 (see the note at the top of this file): the heap has to land
+// below the 4 GB line, or retail CrySystem's truncated slab pointers come back corrupt and the
+// engine dies with "Failed CMTSafeHeap::m_pBigPool allocation" before it finishes starting.
+// Reported by a tester whose machine laid memory out differently than the development one.
+typedef unsigned (__stdcall *TimePeriodFn)(unsigned);
+static TimePeriodFn g_timeBeginPeriod = 0;
+static TimePeriodFn g_timeEndPeriod   = 0;
+
+static void LoadTimerApi()
+{
+	HMODULE winmm = LoadLibraryA("winmm.dll");
+	if (!winmm) return;
+	g_timeBeginPeriod = (TimePeriodFn)GetProcAddress(winmm, "timeBeginPeriod");
+	g_timeEndPeriod   = (TimePeriodFn)GetProcAddress(winmm, "timeEndPeriod");
+}
 
 // Borderless windowed fullscreen.
 //
@@ -339,11 +355,14 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 		dd.cb = sizeof(dd);
 	}
 
-	HDC hdc = GetDC(NULL);
-	if (hdc) {
-		int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
-		DiagLine(f, "DPI scale      : %d%% (%d dpi)", (dpi * 100) / 96, dpi);
-		ReleaseDC(NULL, hdc);
+	// GetDpiForSystem is in USER32, which is already imported; using it avoids a GDI32
+	// dependency, for the same load-order reason described above.
+	typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+	HMODULE user32 = GetModuleHandleA("user32.dll");
+	GetDpiForSystemFn pGetDpi = user32 ? (GetDpiForSystemFn)GetProcAddress(user32, "GetDpiForSystem") : 0;
+	if (pGetDpi) {
+		UINT dpi = pGetDpi();
+		if (dpi) DiagLine(f, "DPI scale      : %u%% (%u dpi)", (dpi * 100) / 96, dpi);
 	}
 	DiagLine(f, "");
 
@@ -388,7 +407,8 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
 	// Before engine init: 15.625 ms -> 1 ms (see the note above timeBeginPeriod).
-	const bool timerRaised = (timeBeginPeriod(1) == 0);
+	LoadTimerApi();
+	const bool timerRaised = (g_timeBeginPeriod && g_timeBeginPeriod(1) == 0);
 
 	SetCwdToGameRoot();
 
@@ -602,6 +622,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		pGameStartup->Run(NULL);
 	}
 	pGameStartup->Shutdown();
-	if (timerRaised) timeEndPeriod(1);   // hand the original quantum back to the system
+	if (timerRaised && g_timeEndPeriod) g_timeEndPeriod(1);   // hand the quantum back to the system
 	return 0;
 }
