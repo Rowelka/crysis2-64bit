@@ -217,7 +217,7 @@ information.
   addresses used here were taken from that project.
 
 This launcher's source is written from scratch (STL-free, so it can be compiled by the VC90
-toolchain); it is not a fork of either project.
+toolchain); it is not a fork of either project. 
 
 ## License
 
