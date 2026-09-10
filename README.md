@@ -132,6 +132,21 @@ SDK) and run it.
 | Stuttering on the level loading screen | Not yet investigated. |
 | Co-op dialogue lines cut off and repeat | Not game-breaking. |
 
+## Diagnostics
+
+On every start the launcher writes `launcher_diag.txt` next to the game, before engine init, so
+the file exists even if the engine dies on startup. It records the launcher build, the command
+line, whether the timer fix and borderless mode actually applied, OS build, CPU thread count,
+RAM, desktop mode and refresh rate, GPU name, DPI scale, the size and date of every engine module,
+and the size of every game pak.
+
+The pak list matters more than it looks: bug reports that appear to be launcher problems often
+turn out to be differences between game copies (retail versus a repack with re-encoded or removed
+files). Comparing pak sizes settles that in seconds instead of a debugging session.
+
+Nothing user-identifying is collected: no user name, no profile paths, no serials, no network
+information.
+
 ## Credits
 
 - **[c1-launcher](https://github.com/ccomrade/c1-launcher)** by *ccomrade* - the original

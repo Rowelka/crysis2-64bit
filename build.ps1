@@ -20,7 +20,7 @@ $env:LIB     = "$wdk\lib\crt\amd64;$wdk\lib\win7\amd64"
 Set-Location $dir
 if (Test-Path $out) { Remove-Item $out -Force }
 
-& $cl /nologo /EHsc /MD /DWIN64 /D_WIN64 /I. Main_min.cpp /Fe"$out" /Fo"$dir\Main_min.obj" /link CrySystem.lib kernel32.lib user32.lib shell32.lib winmm.lib /SUBSYSTEM:WINDOWS /MANIFEST
+& $cl /nologo /EHsc /MD /DWIN64 /D_WIN64 /I. Main_min.cpp /Fe"$out" /Fo"$dir\Main_min.obj" /link CrySystem.lib kernel32.lib user32.lib shell32.lib winmm.lib gdi32.lib /SUBSYSTEM:WINDOWS /MANIFEST
 if (-not (Test-Path $out)) { throw "BUILD FAILED: $out not created" }
 
 # Embed manifest (VC90.CRT dependency).

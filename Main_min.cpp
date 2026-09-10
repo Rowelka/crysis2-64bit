@@ -5,6 +5,7 @@
 // вместе с msvcr90 в правильном порядке.
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include "cry_min.h"
 
@@ -248,6 +249,127 @@ static DWORD WINAPI BorderlessThread(LPVOID)
 	}
 }
 
+// [run91] ДИАГНОСТИЧЕСКИЙ ОТЧЁТ для тестеров.
+// Зачем: проблемы на ЧУЖИХ машинах для нас невидимы в принципе. У юзера FPS-лок был 64, у тестера
+// ErBuSlayer - 60; у одного alt-tab крашил, у другого нет. Пока лаунчер не пишет, на каком железе
+// и в каком режиме он запустился, такие баги отлаживать нечем - остаются пересказы словами.
+// Тестер просто присылает launcher_diag.txt.
+// Приватность: только техническое. НИКАКИХ имён пользователя, путей профиля, серийников, сети.
+static void DiagLine(FILE* f, const char* fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+}
+
+static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderless)
+{
+	FILE* f = fopen("launcher_diag.txt", "w");
+	if (!f) return;
+
+	DiagLine(f, "=== crysis2-64bit launcher diagnostics ===");
+	DiagLine(f, "launcher build : %s %s", __DATE__, __TIME__);
+	DiagLine(f, "command line   : %s", (cmdLine && *cmdLine) ? cmdLine : "(none)");
+	DiagLine(f, "timer 1ms      : %s", timerRaised ? "raised OK" : "FAILED (expect ~64 fps cap)");
+	DiagLine(f, "borderless     : %s", borderless ? "enabled" : "disabled (-noborderless)");
+	DiagLine(f, "");
+
+	DiagLine(f, "--- system ---");
+	// RtlGetVersion не врёт про версию (GetVersionEx без манифеста занижает).
+	typedef LONG (WINAPI *RtlGetVersion_t)(void*);
+	struct { ULONG dwOSVersionInfoSize; ULONG major, minor, build, platformId; WCHAR csd[128]; } osv;
+	memset(&osv, 0, sizeof(osv));
+	osv.dwOSVersionInfoSize = sizeof(osv);
+	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+	RtlGetVersion_t pRtlGetVersion = ntdll ? (RtlGetVersion_t)GetProcAddress(ntdll, "RtlGetVersion") : 0;
+	if (pRtlGetVersion && pRtlGetVersion(&osv) == 0)
+		DiagLine(f, "Windows        : %lu.%lu build %lu", osv.major, osv.minor, osv.build);
+	else
+		DiagLine(f, "Windows        : (version query failed)");
+
+	SYSTEM_INFO si;
+	memset(&si, 0, sizeof(si));
+	GetNativeSystemInfo(&si);
+	DiagLine(f, "CPU threads    : %lu", si.dwNumberOfProcessors);
+
+	MEMORYSTATUSEX ms;
+	memset(&ms, 0, sizeof(ms));
+	ms.dwLength = sizeof(ms);
+	if (GlobalMemoryStatusEx(&ms))
+		DiagLine(f, "RAM            : %llu MB total, %llu MB available",
+		         ms.ullTotalPhys / (1024ull*1024ull), ms.ullAvailPhys / (1024ull*1024ull));
+	DiagLine(f, "");
+
+	DiagLine(f, "--- display ---");
+	DEVMODEA dm;
+	memset(&dm, 0, sizeof(dm));
+	dm.dmSize = sizeof(dm);
+	if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm))
+		DiagLine(f, "desktop mode   : %lux%lu @ %lu Hz, %lu bpp",
+		         dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency, dm.dmBitsPerPel);
+	DiagLine(f, "virtual screen : %dx%d, monitors: %d",
+	         GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
+	         GetSystemMetrics(SM_CMONITORS));
+
+	// Имя видеоадаптера и драйвера: EnumDisplayDevices, без DXGI-зависимостей.
+	DISPLAY_DEVICEA dd;
+	memset(&dd, 0, sizeof(dd));
+	dd.cb = sizeof(dd);
+	for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++) {
+		if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+			DiagLine(f, "adapter %lu      : %s", i, dd.DeviceString);
+		memset(&dd, 0, sizeof(dd));
+		dd.cb = sizeof(dd);
+	}
+
+	HDC hdc = GetDC(NULL);
+	if (hdc) {
+		int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+		DiagLine(f, "DPI scale      : %d%% (%d dpi)", (dpi * 100) / 96, dpi);
+		ReleaseDC(NULL, hdc);
+	}
+	DiagLine(f, "");
+
+	DiagLine(f, "--- Bin64 modules (size / modified) ---");
+	static const char* mods[] = {
+		"CrySystem.dll", "CryRenderD3D11.dll", "CryGameCrysis2.dll", "CryAction.dll",
+		"CryPhysics.dll", "Cry3DEngine.dll", "CryAnimation.dll", "mechanics.dll", 0
+	};
+	for (int i = 0; mods[i]; i++) {
+		WIN32_FILE_ATTRIBUTE_DATA fa;
+		char path[MAX_PATH];
+		sprintf(path, "Bin64/%s", mods[i]);
+		if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+			SYSTEMTIME st;
+			FileTimeToSystemTime(&fa.ftLastWriteTime, &st);
+			ULONGLONG sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+			DiagLine(f, "  %-22s %10llu  %04u-%02u-%02u", mods[i], sz, st.wYear, st.wMonth, st.wDay);
+		} else {
+			DiagLine(f, "  %-22s MISSING", mods[i]);
+		}
+	}
+	DiagLine(f, "");
+
+	// Состав паков ловит различия сборок игры (retail / repack): у разных копий он разный,
+	// и баг, который выглядит как ошибка кода, может оказаться отсутствующим файлом.
+	DiagLine(f, "--- game paks ---");
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA("gamecrysis2/*.pak", &fd);
+	if (h != INVALID_HANDLE_VALUE) {
+		do {
+			ULONGLONG sz = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+			DiagLine(f, "  %-26s %12llu", fd.cFileName, sz);
+		} while (FindNextFileA(h, &fd));
+		FindClose(h);
+	} else {
+		DiagLine(f, "  (gamecrysis2 not found)");
+	}
+
+	fclose(f);
+}
+
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
 	// [run91] ДО инициализации движка: 15.625 мс -> 1 мс.
@@ -277,6 +399,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		HANDLE th = CreateThread(NULL, 0, BorderlessThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
+
+	// [run91] Отчёт пишем ДО инициализации движка: если движок упадёт на старте,
+	// файл уже на диске и тестеру есть что прислать.
+	WriteDiagReport(lpCmdLine, timerRaised, wantBorderless);
 
 	// 1) Поднять систему памяти движка ПЕРВОЙ (editor-порядок).
 	ISystem* pSystem = CreateSystemInterface(startupParams);
