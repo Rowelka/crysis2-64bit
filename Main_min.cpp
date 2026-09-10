@@ -307,6 +307,40 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	DiagLine(f, "borderless     : %s", borderless ? "enabled" : "disabled (-noborderless)");
 	DiagLine(f, "");
 
+	// Install path, write access, locale and free space. A tester hit a startup failure that
+	// none of the hardware fields explained; these cover the environment differences that are
+	// invisible otherwise - a read-only Program Files install, a full disk, or a locale whose
+	// case rules differ (Turkish being the classic example, where 'i' does not uppercase to 'I').
+	DiagLine(f, "--- install ---");
+	{
+		char cwd[MAX_PATH];
+		if (GetCurrentDirectoryA(MAX_PATH, cwd))
+			DiagLine(f, "game path      : %s", cwd);
+
+		// Probe write access the only reliable way: actually try to create a file.
+		HANDLE probe = CreateFileA("write_probe.tmp", GENERIC_WRITE, 0, NULL,
+		                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+		if (probe != INVALID_HANDLE_VALUE) {
+			DiagLine(f, "write access   : yes");
+			CloseHandle(probe);
+		} else {
+			DiagLine(f, "write access   : NO (error %lu) - the engine cannot write its own files here", GetLastError());
+		}
+
+		ULARGE_INTEGER freeBytes;
+		memset(&freeBytes, 0, sizeof(freeBytes));
+		if (GetDiskFreeSpaceExA(NULL, &freeBytes, NULL, NULL))
+			DiagLine(f, "free disk      : %llu MB", freeBytes.QuadPart / (1024ull * 1024ull));
+
+		char lang[64] = {0};
+		char ctry[64] = {0};
+		GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SENGLANGUAGE, lang, sizeof(lang));
+		GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SENGCOUNTRY, ctry, sizeof(ctry));
+		DiagLine(f, "locale         : %s / %s", lang[0] ? lang : "?", ctry[0] ? ctry : "?");
+		DiagLine(f, "ANSI codepage  : %u", GetACP());
+	}
+	DiagLine(f, "");
+
 	DiagLine(f, "--- system ---");
 	// RtlGetVersion reports the real version; GetVersionEx under-reports without a manifest.
 	typedef LONG (WINAPI *RtlGetVersion_t)(void*);
