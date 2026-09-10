@@ -1,0 +1,3 @@
+LIBRARY CrySystem.dll
+EXPORTS
+    CreateSystemInterface
