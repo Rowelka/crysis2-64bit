@@ -30,7 +30,7 @@ measured WaitPhys                         = ~15.5 ms      <- exactly one quantum
 
 When the main thread waits on the physics barrier, Windows rounds that wait **up** to the next
 scheduler quantum. One frame becomes one quantum. Checking the import tables confirms nobody
-ever raises the resolution — `Crysis2.exe`, `Editor.exe` and `CrySystem.dll` all import only
+ever raises the resolution - `Crysis2.exe`, `Editor.exe` and `CrySystem.dll` all import only
 `timeGetTime` from WINMM, never `timeBeginPeriod`:
 
 ```
@@ -39,7 +39,7 @@ Editor.exe                   ->  WINMM.dll: [timeGetTime]
 CrySystem.dll (x64)          ->  WINMM.dll: [timeGetTime]
 ```
 
-This also explains the odd bimodal behaviour players reported — the framerate is either pinned
+This also explains the odd bimodal behaviour players reported - the framerate is either pinned
 at 64 or spikes to 200-300, with nothing in between. Frames that don't hit the wait run at full
 speed; frames that do hit it cost a whole quantum. That is a signature of a timer quantum, not
 of load.
@@ -51,14 +51,14 @@ call is per-process, so it affects only the game.
 
 > Note: this is listed as an open item in [c2-launcher](https://github.com/ItsNiklas/c2-launcher)'s
 > TODO (*"fix DX11 fps cap limit on fullscreen"*), where the working hypothesis was to force
-> borderless windowed. The real cause turned out to be unrelated to the window mode — the lock is
+> borderless windowed. The real cause turned out to be unrelated to the window mode - the lock is
 > present in windowed mode too.
 
-### 2. Tearing, input lag and Alt-Tab crashes — one fix
+### 2. Tearing, input lag and Alt-Tab crashes - one fix
 
 With the framerate unlocked, exclusive fullscreen tears: the game renders well above the display
 refresh rate. Enabling VSync is not a good answer here, because the engine has no refresh-rate
-CVar at all — `CryRenderD3D11` exposes only `r_Fullscreen` and `r_VSync`, so DXGI hands it 60 Hz
+CVar at all - `CryRenderD3D11` exposes only `r_Fullscreen` and `r_VSync`, so DXGI hands it 60 Hz
 and VSync pins the game to 60 FPS with noticeable input lag, even on a 165 Hz display.
 
 Windowed mode behaves completely differently: frames go through the Windows compositor, which
