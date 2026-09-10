@@ -369,7 +369,7 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	DiagLine(f, "--- Bin64 modules (size / modified) ---");
 	static const char* mods[] = {
 		"CrySystem.dll", "CryRenderD3D11.dll", "CryGameCrysis2.dll", "CryAction.dll",
-		"CryPhysics.dll", "Cry3DEngine.dll", "CryAnimation.dll", "mechanics.dll", 0
+		"CryPhysics.dll", "Cry3DEngine.dll", "CryAnimation.dll", 0
 	};
 	for (int i = 0; mods[i]; i++) {
 		WIN32_FILE_ATTRIBUTE_DATA fa;
