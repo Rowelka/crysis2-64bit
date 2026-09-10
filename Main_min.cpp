@@ -190,7 +190,8 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 // point of building against msvcr90 (see the note at the top of this file): the heap has to land
 // below the 4 GB line, or retail CrySystem's truncated slab pointers come back corrupt and the
 // engine dies with "Failed CMTSafeHeap::m_pBigPool allocation" before it finishes starting.
-// Reported by a tester whose machine laid memory out differently than the development one.
+// Whether this matters depends on how a given system lays out the address space, so it can
+// hold on one machine and fail on another.
 typedef unsigned (__stdcall *TimePeriodFn)(unsigned);
 static TimePeriodFn g_timeBeginPeriod = 0;
 static TimePeriodFn g_timeEndPeriod   = 0;
@@ -287,10 +288,10 @@ static DWORD WINAPI BorderlessThread(LPVOID)
 
 // Diagnostic report for testers.
 //
-// Problems on other people's machines are invisible to us. One tester saw a 60 FPS cap and
-// Alt-Tab crashes; another saw neither. With nothing written down about the hardware and the
-// mode the launcher started in, such reports stay descriptions in chat and cannot be debugged.
-// Now the tester just sends launcher_diag.txt.
+// Startup behaviour varies between systems in ways that cannot be reproduced elsewhere: the
+// same build can hit a framerate cap or an Alt-Tab crash on one machine and neither on another.
+// Without a record of the hardware and of the mode the launcher started in, such reports cannot
+// be acted on. This file makes them concrete.
 //
 // Only technical information is collected: no user name, no profile paths, no serials,
 // nothing about the network.
@@ -315,10 +316,10 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	DiagLine(f, "borderless     : %s", borderless ? "enabled" : "disabled (-noborderless)");
 	DiagLine(f, "");
 
-	// Install path, write access, locale and free space. A tester hit a startup failure that
-	// none of the hardware fields explained; these cover the environment differences that are
-	// invisible otherwise - a read-only Program Files install, a full disk, or a locale whose
-	// case rules differ (Turkish being the classic example, where 'i' does not uppercase to 'I').
+	// Install path, write access, locale and free space: environment differences that hardware
+	// fields do not cover and that can cause startup failures on their own - a read-only
+	// Program Files install, a full disk, or a locale whose case rules differ (Turkish being the
+	// classic example, where 'i' does not uppercase to 'I').
 	DiagLine(f, "--- install ---");
 	{
 		char cwd[MAX_PATH];
@@ -410,12 +411,13 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 
 	// Allocator probe.
 	//
-	// A tester hits "Failed CMTSafeHeap::m_pBigPool allocation" on startup while 19 GB are free.
-	// That message means new[] returned NULL for a pool of at most 14 MB, so the engine's own
-	// allocator is already broken by the time it asks. CrySystem is imported statically, so it
-	// is loaded and its static initialisation has run before any of this code executes - we can
-	// read its state before the engine destroys itself, and repeat the same allocation through
-	// the same CRT it uses.
+	// Some systems abort startup with "Failed CMTSafeHeap::m_pBigPool allocation" while tens of
+	// gigabytes are free. That message means new[] returned NULL for a pool of at most 14 MB, so
+	// the engine's allocator is already in a bad state by the time it asks.
+	//
+	// CrySystem is imported statically, so it is loaded and its static initialisation has run
+	// before any of this code executes. Its allocator state is therefore readable before the
+	// engine can fail, and the same allocation can be repeated through the CRT the engine uses.
 	//
 	// Offsets come from reversing this exact build (CrySystem 1.1.1.217); they are checked
 	// against the module size first so a different build simply skips the probe.
@@ -540,9 +542,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// intro videos; the files themselves are present, so this is a decoder problem, not missing
 	// content. Rather than chase the decoder, skip the intro.
 	//
-	// r_DisplayInfo draws a debug overlay whose status line ends in "DevMode", which a tester
-	// reported as the build shipping with debug facilities active. It needs no reversing, just
-	// this CVar. Pass -keepintro to restore the original behaviour.
+	// r_DisplayInfo draws a debug overlay whose status line ends in "DevMode", which makes the
+	// build look like a debug build. It is enabled by the game's own system.cfg, so no reversing
+	// is needed to remove it - only this CVar. Pass -keepintro to restore the original behaviour.
 	if (!(lpCmdLine && strstr(lpCmdLine, "-keepintro")))
 	{
 		strncat(startupParams.szSystemCmdLine,

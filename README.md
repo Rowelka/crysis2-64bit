@@ -136,8 +136,8 @@ MSVC - it is load-bearing, not legacy.
 Two things made the build look like a debug build rather than a game.
 
 The x64 `CrySystem.dll` is an editor build and enables `r_DisplayInfo`, which draws a debug
-overlay whose status line ends in `DevMode`. A tester reported this as "64bit comes with full
-debug stuff activated". It turned out not to need any reversing: one CVar switches it off.
+overlay whose status line ends in `DevMode`, which makes the build look like a debug build. It is
+enabled by the game's own `system.cfg` and needs no reversing to remove - one CVar switches it off.
 
 The startup logos also render as white rectangles on black, because the x64 build fails to decode
 the intro videos. The files themselves are present and `Videos.pak` is intact, so this is a
