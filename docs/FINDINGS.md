@@ -13,7 +13,7 @@ causes and measure where the frame time actually goes.
 | Suspect | Test | Result |
 |---|---|---|
 | VSync | `r_VSync 0` | no change |
-| Fullscreen / DWM composition | windowed vs fullscreen | 64 FPS in **both** — kills the DWM theory |
+| Fullscreen / DWM composition | windowed vs fullscreen | 64 FPS in **both** - kills the DWM theory |
 | Engine frame cap | `sys_MaxFPS 0`, `sys_MaxFPS 300` | no change |
 | Physics thread count | `p_num_threads 4` | no change |
 | Physics timestep | `p_fixed_timestep 0`, `p_max_substeps 1` | no change |
@@ -52,13 +52,13 @@ FPS on an RTX 3060 at 1080p.
 
 Players reported the framerate either pinned at 64 or spiking to 200-300, with nothing in
 between. That gap is the tell. Load-related limits produce a continuous spread of framerates;
-a quantum produces two states — frames that hit the wait pay a full quantum, frames that don't
+a quantum produces two states - frames that hit the wait pay a full quantum, frames that don't
 run free. Any explanation that doesn't account for the *missing middle* is the wrong explanation.
 
 ### Side effect worth knowing
 
 Once the lock is gone the framerate exceeds the refresh rate, so tearing appears. That is not a
-regression from the fix — it is the normal consequence of an uncapped framerate, and re-enabling
+regression from the fix - it is the normal consequence of an uncapped framerate, and re-enabling
 VSync now holds the refresh rate solidly because the headroom is real.
 
 ## The x64 heap truncation
@@ -71,19 +71,19 @@ launcher with the VC90 compiler from WDK 7.1 and linking `msvcr90` as the primar
 reproduces that layout, and the truncation becomes harmless.
 
 This constrains the whole project: the launcher must stay STL-free, because the WDK's bundled STL
-does not compile on its own. `cry_min.h` exists for that reason — it declares just enough of the
+does not compile on its own. `cry_min.h` exists for that reason - it declares just enough of the
 engine interfaces to boot the system, with the struct layouts matching what retail `CrySystem.dll`
 expects.
 
 ## Runtime patches applied at startup
 
-**CryAction release asserts** (addresses from c2-launcher, CryAction 1.1.1.217) — the Bin64 build
+**CryAction release asserts** (addresses from c2-launcher, CryAction 1.1.1.217) - the Bin64 build
 force-crashes on asserts along the `CLevelSystem::LoadLevel` path. Patched to jumps in memory
 before the game DLL initialises.
 
-**CMovieSystem use-after-free** — unloading a layer during a cutscene precache leaves dangling
+**CMovieSystem use-after-free** - unloading a layer during a cutscene precache leaves dangling
 descriptors in the movie update list. Cheap inline guards catch null vtables, but a pointer into
 an unmapped hole passes them and faults on dereference. A vectored exception handler catches the
 fault inside the guarded code range and advances the loop to the next element. Note it must catch
-*any* exception code, not just `0xC0000005` — a bad pointer landing in a guard page raises
+*any* exception code, not just `0xC0000005` - a bad pointer landing in a guard page raises
 `STATUS_GUARD_PAGE_VIOLATION` instead.

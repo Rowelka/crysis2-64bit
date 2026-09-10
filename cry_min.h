@@ -3,7 +3,7 @@
 // WDK-STL (stl70) не компилируется сам по себе (внутр. рассинхрон версий заголовков), а лаунчеру
 // STL и не нужен. Определения скопированы ДОСЛОВНО из retail-заголовков
 // (ISystem.h / IGameStartup.h / IGameRef.h), #ifdef разрешены как в retail-Windows-сборке
-// (без OPEN_AUTOMATE, без LINUX) — layout совпадает с тем, чего ждёт retail CrySystem.dll.
+// (без OPEN_AUTOMATE, без LINUX) - layout совпадает с тем, чего ждёт retail CrySystem.dll.
 // В конце добавлен запас _pad[] на случай, если retail-структура чуть больше (лишние поля=0).
 
 #include <string.h>  // memset

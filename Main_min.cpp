@@ -34,9 +34,9 @@ static void PatchByte(unsigned char* addr, unsigned char val)
 // во время precache катсцены (Battery Park) переиспользуется → элементы мусорные. Дешёвые guard'ы в
 // code-cave (см. блок 1c) отсекают явный мусор, НО указатель с нулевыми старшими битами, ведущий в
 // размапленную дыру (напр. 0x6A357E0E), их проходит и падает на mov rax,[rcx]. VEH ловит эту A/V
-// ВНУТРИ cave и переставляет RIP на пропуск элемента (0xF2EC=add rbx,0x20) — цикл идёт со следующего
-// (rbx/r14 не тронуты). Что бы ни было за мусор — не крашим, максимум теряем анимацию битой ноды.
-// ВАЖНО: ловим ЛЮБОЙ код исключения при RIP внутри cave, НЕ только 0xC0000005 — битый rcx может попасть
+// ВНУТРИ cave и переставляет RIP на пропуск элемента (0xF2EC=add rbx,0x20) - цикл идёт со следующего
+// (rbx/r14 не тронуты). Что бы ни было за мусор - не крашим, максимум теряем анимацию битой ноды.
+// ВАЖНО: ловим ЛЮБОЙ код исключения при RIP внутри cave, НЕ только 0xC0000005 - битый rcx может попасть
 // в guard-страницу → 0x80000001 (STATUS_GUARD_PAGE_VIOLATION), тоже A/V по сути. В cave ничего, кроме
 // доступа к памяти по битому указателю, упасть не может, поэтому код исключения не проверяем.
 static unsigned char*      g_movieCave = 0;
@@ -48,7 +48,7 @@ static unsigned long long  g_movieRetSkip = 0;
 // g_movieOldBegin хранит begin с прошлой итерации; при реаллокации ([r14+0x50]!=old) трамплин
 // пересчитывает rbx = new_begin + (rbx - old_begin) → продолжает по НОВОМУ буферу (живые ноды там).
 static unsigned long long  g_movieOldBegin = 0;
-// [run87] база CryMovie.dll — для VEH-обхода OOB аксессора ключей трека (спавн-краш Intro).
+// [run87] база CryMovie.dll - для VEH-обхода OOB аксессора ключей трека (спавн-краш Intro).
 static unsigned long long  g_cryMovieBase = 0;
 static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 {
@@ -74,10 +74,10 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
 		}
-		// СЛУЧАЙ C: OOB в аксессоре ключа трека CryMovie (GetKeyValue по битому глобальному индексу —
+		// СЛУЧАЙ C: OOB в аксессоре ключа трека CryMovie (GetKeyValue по битому глобальному индексу -
 		// спавн-краш Intro: movss xmm0,[buffer+index*8], index битый → чтение вне массива ключей). При A/V
 		// в аксессоре [0x2B5F0,0x2B604) вернуть 0.0f (xmm0=0) и ret (0x2B604). Срабатывает ТОЛЬКО при OOB,
-		// валидные вызовы не трогает. Первопричина (откуда битый индекс) — в бэклоге (levels_feedback.md).
+		// валидные вызовы не трогает. Первопричина (откуда битый индекс) - в бэклоге (levels_feedback.md).
 		if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && g_cryMovieBase) {
 			unsigned long long accLo = g_cryMovieBase + 0x2B5F0;
 			unsigned long long accHi = g_cryMovieBase + 0x2B604;
@@ -89,7 +89,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			// СЛУЧАЙ D: обход иерархии нод CryMovie 0x3A630 [0x3A630,0x3A69B) (this->GetParent/Child slot55
 			// → под-объект, slot2=GetType). На спавне Intro под-объект = переиспользованная movie-память
 			// (XML-данные, битый vtable 0x3600000000) → краш. Возврат «не найдено» (eax=0) через путь
-			// 0x3A67A (xor eax,eax; add rsp,0x20; pop rbx; ret — стек восстанавливается корректно).
+			// 0x3A67A (xor eax,eax; add rsp,0x20; pop rbx; ret - стек восстанавливается корректно).
 			unsigned long long h_lo = g_cryMovieBase + 0x3A630;
 			unsigned long long h_hi = g_cryMovieBase + 0x3A69B;
 			if (rip >= h_lo && rip < h_hi) {
@@ -99,7 +99,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			// СЛУЧАЙ E: `call [node_vtable+0x1b8]` (slot55) ВНУТРИ обхода иерархии 0x3A630 прыгнул на ДАННЫЕ
 			// (битый vtable под-объекта: слот ведёт не в код, а в .rdata CryMovie → EXECUTE A/V, напр. 0x644E8).
 			// RIP улетел ВНЕ функции, но call запушил свой return-адрес (в [0x3A630,0x3A69B)) на вершину стека.
-			// Признак: A/V + [rsp] в диапазоне функции иерархии, а сам RIP — вне. Снимаем фейковый return call
+			// Признак: A/V + [rsp] в диапазоне функции иерархии, а сам RIP - вне. Снимаем фейковый return call
 			// (rsp+=8) и выходим «узел не найден» через 0x3A67A. Стек сходится (проверено по дампу 26568).
 			if (!(rip >= h_lo && rip < h_hi)) {
 				unsigned long long rsp = (unsigned long long)ep->ContextRecord->Rsp;
@@ -115,7 +115,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			//   0x211B) / [rax+0x108](slot33 Animate, 0x2138). На спавне Intro нода = переиспользованная
 			//   память (vtable в КУЧУ 0x45xxxxxx, не в модуль → slot ведёт на данные CryAction → EXECUTE A/V;
 			//   либо read A/V внутри). ПРОПУСКАЕМ битую ноду → 0x213E (add rbx,8; ++it; loop), остальные
-			//   ноды секвенции сохраняются (rbx=it/rdi=this/rsi целы — упало на 1-м байте вызова).
+			//   ноды секвенции сохраняются (rbx=it/rdi=this/rsi целы - упало на 1-м байте вызова).
 			if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && g_cryMovieBase) {
 				unsigned long long fl = g_cryMovieBase + 0x2104;
 				unsigned long long fh = g_cryMovieBase + 0x2148;
@@ -163,7 +163,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 
 // [run91] ★ПЕРВОПРИЧИНА FPS-лока ~64: КВАНТ СИСТЕМНОГО ТАЙМЕРА Windows (15.625 мс), а НЕ нагрузка.
 // Проверено разбором импортов: Crysis2.exe / Editor.exe / CrySystem.dll тянут из WINMM ТОЛЬКО
-// timeGetTime — timeBeginPeriod не зовёт НИКТО, разрешение таймера остаётся системным дефолтом.
+// timeGetTime - timeBeginPeriod не зовёт НИКТО, разрешение таймера остаётся системным дефолтом.
 // Main-поток ждёт физ-барьер (замер: WaitPhys ~15.5 мс при Phys 0.1 мс и GPU 5.6 мс = железо
 // простаивает) → ожидание округляется ВВЕРХ до кванта → 1000/15.625 = ровно 64.0 FPS.
 // Тем же объясняются спонтанные срывы на 200-300: когда ожидания нет, кадр идёт на полной скорости
@@ -172,10 +172,10 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 extern "C" __declspec(dllimport) unsigned __stdcall timeBeginPeriod(unsigned uPeriod);
 extern "C" __declspec(dllimport) unsigned __stdcall timeEndPeriod(unsigned uPeriod);
 
-// [run91] BORDERLESS WINDOWED FULLSCREEN — окно без рамки на весь экран.
-// Наблюдение юзера (10.09): в ОКНЕ игра идёт плавно и БЕЗ разрывов; в эксклюзивном fullscreen —
+// [run91] BORDERLESS WINDOWED FULLSCREEN - окно без рамки на весь экран.
+// Наблюдение юзера (10.09): в ОКНЕ игра идёт плавно и БЕЗ разрывов; в эксклюзивном fullscreen -
 // разрывы; r_VSync 1 роняет до 60 FPS и добавляет инпут-лаг. Объяснение: в оконном режиме кадры
-// проходят через композитор Windows (DWM), который синхронизирует вывод сам — тиринг невозможен
+// проходят через композитор Windows (DWM), который синхронизирует вывод сам - тиринг невозможен
 // by design, при этом кадры не ограничены и задержки vsync нет. В эксклюзивном fullscreen движок
 // выводит напрямую, а частоту взять неоткуда: в CryRenderD3D11 есть ТОЛЬКО r_Fullscreen и r_VSync,
 // CVar частоты обновления не существует → DXGI отдаёт 60 Гц, монитор 165 Гц не используется
@@ -217,18 +217,21 @@ static DWORD WINAPI BorderlessThread(LPVOID)
 	const int w   = GetSystemMetrics(SM_CXSCREEN);
 	const int hgt = GetSystemMetrics(SM_CYSCREEN);
 	bool logged = false;
-	// Отдельный поток, опрос раз в 500мс (НЕ в кадровом цикле — правило hot-path соблюдено).
+	// Отдельный поток, опрос раз в 500мс (НЕ в кадровом цикле - правило hot-path соблюдено).
 	// Не «нашли и вышли»: движок создаёт окно не сразу и может пересоздать его при смене
 	// видеорежима, поэтому следим всё время игры и переприменяем стиль.
-	for (;;)
+	for (int tick = 0; ; tick++)
 	{
-		Sleep(500);
+		// Первые ~10 секунд опрашиваем часто: окно создаётся на старте игры, и полсекунды
+		// с рамкой заметны глазом (мелькание при загрузке). Дальше редко - там это уже
+		// только страховка на случай пересоздания окна при смене видеорежима.
+		Sleep(tick < 200 ? 50 : 500);
 		SBorderlessSearch s;
 		s.pid = GetCurrentProcessId();
 		s.found = NULL;
 		EnumWindows(BorderlessEnumProc, (LPARAM)&s);
 		if (!s.found) continue;
-		if (IsIconic(s.found)) continue;                       // свёрнуто — не мешаем alt-tab
+		if (IsIconic(s.found)) continue;                       // свёрнуто - не мешаем alt-tab
 		LONG_PTR st = GetWindowLongPtrA(s.found, GWL_STYLE);
 		RECT r;
 		if (!GetWindowRect(s.found, &r)) continue;
@@ -262,7 +265,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	if (wantBorderless)
 	{
 		// Просим движок стартовать в окне и в разрешении экрана ('+' = команда консоли в CryEngine).
-		// Если профиль игры перекроет это на fullscreen — ничего не сломается: окно эксклюзива уже
+		// Если профиль игры перекроет это на fullscreen - ничего не сломается: окно эксклюзива уже
 		// без рамки, и поток его не тронет.
 		char extra[128];
 		sprintf(extra, " +r_Fullscreen 0 +r_Width %d +r_Height %d",
@@ -303,8 +306,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// 1c) Фикс краха CryMovie в game-mode (цикл CMovieSystem-update, loop-body @0xF250, back-edge
 	// @0xF2F4→0xF250). Обход списка элементов [r14+0x50..0x58], на каждом: rcx=[rbx]; rax=[rcx](vtable);
 	// call [rax+0x80] (slot16). ДВА вида битых элементов ловим:
-	//   (1) NULL-vtable ([rcx]==0) — спавн-краш после катсцены (был первый фикс);
-	//   (2) ВИСЯЧИЙ объект (use-after-free) — при выгрузке слоя во время precache катсцены память
+	//   (1) NULL-vtable ([rcx]==0) - спавн-краш после катсцены (был первый фикс);
+	//   (2) ВИСЯЧИЙ объект (use-after-free) - при выгрузке слоя во время precache катсцены память
 	//       элемента переиспользуется под XML-данные, vtable становится НЕ-null, но мусорным
 	//       (указывает в кучу 0x26xxxxxx, не в модуль) → call [мусор+0x80] → execute-краш на Battery Park.
 	// Полные дампы (fulldump.py): (2а) vtable=0x2633ADE0 (heap) → call[heap+0x80] execute-fault;
@@ -312,10 +315,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// и vtable, и сам объект (3-й дамп: мусор [rbx]=0x30286B50 указал в Cry3DEngine и прошёл широкий
 	// диапазон → упал во 2-м call'е тела 0xF2B5). Массив дескрипторов CMovieSystem [r14+0x50..0x58]
 	// (stride 0x20, 3 vcall'а на элемент: 0xF256/0xF2B5/0xF2E6) переиспользован. ДВА guard'а: (g1) rcx=[rbx]
-	// валиден — старшие 32 бита == 0 (вся память процесса < 4ГБ; мусор-тег 0x5_00000001 отсекается) И
+	// валиден - старшие 32 бита == 0 (вся память процесса < 4ГБ; мусор-тег 0x5_00000001 отсекается) И
 	// rcx>=0x10000 (не NULL/мелкий); (g2) vtable=[rcx] в ТОЧНЫХ границах CryMovie.dll [0x34000000,0x34082000)
 	// (ноды CMovie там). Любой промах → SKIP всего элемента (jmp 0xF2EC=конец тела, минуя ВСЕ 3 call'а),
-	// иначе штатно (call [rax+0x80], jmp 0xF25C). Что прошло guard'ы, но упало — ловит MovieVEH (см. выше).
+	// иначе штатно (call [rax+0x80], jmp 0xF25C). Что прошло guard'ы, но упало - ловит MovieVEH (см. выше).
 	// Патч на 0xF250 = x64-absolute (mov rax,cave; jmp rax).
 	{
 		HMODULE cryMovie = LoadLibraryA("CryMovie.dll");
@@ -355,14 +358,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 				cave[j_first+1]  = (unsigned char)(L_sync - (j_first+2));                           // rel8 -> L_sync
 				cave[j_noreal+1] = (unsigned char)(L_sync - (j_noreal+2));
 				cave[i++]=0x48; cave[i++]=0x8B; cave[i++]=0x0B;                                     // mov rcx,[rbx]  (указатель на объект-элемент)
-				// guard1: rcx — валидный указатель? Вся память процесса в младших 4ГБ (модули 0x1C..0x39,
+				// guard1: rcx - валидный указатель? Вся память процесса в младших 4ГБ (модули 0x1C..0x39,
 				// куча/стек тоже). Мусор-тег 0x500000001 имеет старшие 32 бита != 0. И NULL/мелкий мусор < 0x10000.
 				cave[i++]=0x49; cave[i++]=0x89; cave[i++]=0xCB;                                     // mov r11,rcx
 				cave[i++]=0x49; cave[i++]=0xC1; cave[i++]=0xEB; cave[i++]=0x20;                      // shr r11,32 (старшие 32 бита)
 				int j_hi = i; cave[i++]=0x75; cave[i++]=0x00;                                       // jnz SKIP (rcx>=4ГБ = мусор 0x5_00000001)
 				cave[i++]=0x48; cave[i++]=0x81; cave[i++]=0xF9; cave[i++]=0x00; cave[i++]=0x00; cave[i++]=0x01; cave[i++]=0x00; // cmp rcx,0x10000
 				int j_lo = i; cave[i++]=0x72; cave[i++]=0x00;                                       // jb SKIP (NULL/мелкий мусор)
-				cave[i++]=0x48; cave[i++]=0x8B; cave[i++]=0x01;                                     // mov rax,[rcx]  (vtable) — теперь безопасно
+				cave[i++]=0x48; cave[i++]=0x8B; cave[i++]=0x01;                                     // mov rax,[rcx]  (vtable) - теперь безопасно
 				// guard2: vtable в ТОЧНЫХ границах CryMovie.dll [0x34000000, 0x34082000). Ноды CMovie
 				// определены в CryMovie, их vtable там. Мусор 0x3474754F (старший байт 0x34, НО за концом
 				// модуля 0x34082000) раньше проходил проверку только-старшего-байта → теперь отсекается.
@@ -403,13 +406,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	}
 
 	// 1d) Фикс лакуны editor-сборки CrySystem: memory-сервис @CrySystem+0x458200 ("CryPak Heap") имеет
-	// slot34/35 = _purecall (CrySystem+0x1AFB72=jmp[import _purecall]) — В EDITOR-БИЛДЕ эти методы НЕ
+	// slot34/35 = _purecall (CrySystem+0x1AFB72=jmp[import _purecall]) - В EDITOR-БИЛДЕ эти методы НЕ
 	// реализованы, а game-код (CUIElement::~ dtor, CryGameReal 0x5E2F60) вызывает slot35 при teardown UI
 	// катсцены Battery Park (Pier_Birds) → FATAL "Pure function call". Диагноз: дамп 38652, наш movie-cave
 	// в стеке → валидная нода → CUIElement dtor → getter(CrySystem 0xA2070)→объект@+0x6FA230 vtable@+0x458200
-	// → call[vtbl+0x118]=_purecall. Все DLL 1.1.1.217, НЕ mismatch — это editor-build лакуна (x64 DLL=ModSDK).
+	// → call[vtbl+0x118]=_purecall. Все DLL 1.1.1.217, НЕ mismatch - это editor-build лакуна (x64 DLL=ModSDK).
 	// ЧИСТЫЙ ФИКС: заменить каждый _purecall в этой vtable на ШТАТНУЮ движковую заглушку CrySystem+0x68340
-	// (`ret 0`) — движок сам ею заполнил мн. др. слоты этого сервиса (slot3/4/5/7/10..14). Метод (cleanup UI)
+	// (`ret 0`) - движок сам ею заполнил мн. др. слоты этого сервиса (slot3/4/5/7/10..14). Метод (cleanup UI)
 	// становится no-op: макс. мелкая утечка при teardown катсцены, НЕ краш, НЕ ломает игру (консистентно с
 	// движком). Патчим vtable (в .rdata) через VirtualProtect. base CrySystem = уже загружен (стат-импорт).
 	{
