@@ -102,6 +102,27 @@ MSVC - it is load-bearing, not legacy.
 
 ---
 
+### 5. Debug overlay and broken intro, off by default
+
+Two things made the build look like a debug build rather than a game.
+
+The x64 `CrySystem.dll` is an editor build and enables `r_DisplayInfo`, which draws a debug
+overlay whose status line ends in `DevMode`. A tester reported this as "64bit comes with full
+debug stuff activated". It turned out not to need any reversing: one CVar switches it off.
+
+The startup logos also render as white rectangles on black, because the x64 build fails to decode
+the intro videos. The files themselves are present and `Videos.pak` is intact, so this is a
+decoder problem rather than missing content. Rather than chase the decoder, the launcher skips
+the intro.
+
+Both are set from the launcher's command line at startup:
+
+```
++g_skipIntro 1 +sys_rendersplashscreen 0 +sys_intromoviesduringinit 0 +r_DisplayInfo 0
+```
+
+Pass `-keepintro` to restore the original behaviour, or set the CVars from the console.
+
 ## Requirements
 
 You need a legitimate copy of **Crysis 2** and the **Crysis 2 Mod SDK**. This repository contains
@@ -128,8 +149,7 @@ SDK) and run it.
 
 | Issue | Notes |
 |---|---|
-| DevMode / `r_DisplayInfo` on by default | The x64 `CrySystem.dll` is an editor build and ships with debug facilities active. Also causes "ReplaceMe" placeholders to be visible. |
-| Stuttering on the level loading screen | Not yet investigated. |
+| Intro videos do not decode | Skipped by default; the decoder itself is unfixed. |
 | Co-op dialogue lines cut off and repeat | Not game-breaking. |
 
 ## Diagnostics

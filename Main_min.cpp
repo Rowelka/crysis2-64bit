@@ -389,7 +389,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		// Просим движок стартовать в окне и в разрешении экрана ('+' = команда консоли в CryEngine).
 		// Если профиль игры перекроет это на fullscreen - ничего не сломается: окно эксклюзива уже
 		// без рамки, и поток его не тронет.
-		char extra[128];
+		char extra[256];
 		sprintf(extra, " +r_Fullscreen 0 +r_Width %d +r_Height %d",
 		        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
 		strncat(startupParams.szSystemCmdLine, extra,
@@ -398,6 +398,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, BorderlessThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
+	}
+
+	// [run91] Заставка и отладочный оверлей по умолчанию ВЫКЛ.
+	// Заставка: видео логотипов в x64-сборке не декодируется и показывает белые прямоугольники
+	// на чёрном (файлы на месте, Videos.pak цел - проблема в декодере). Пропускаем её штатно.
+	// r_DisplayInfo: editor-билд CrySystem включает отладочный оверлей сам, и именно из-за него
+	// в углу висит строка с "DevMode" (жалоба тестера ErBuSlayer: "64bit comes with full debug
+	// stuff activated"). Это не требует реверса - достаточно CVar.
+	// Вернуть можно консолью или флагом -keepintro.
+	if (!(lpCmdLine && strstr(lpCmdLine, "-keepintro")))
+	{
+		strncat(startupParams.szSystemCmdLine,
+		        " +g_skipIntro 1 +sys_rendersplashscreen 0 +sys_intromoviesduringinit 0 +r_DisplayInfo 0",
+		        sizeof(startupParams.szSystemCmdLine) - strlen(startupParams.szSystemCmdLine) - 1);
 	}
 
 	// [run91] Отчёт пишем ДО инициализации движка: если движок упадёт на старте,
