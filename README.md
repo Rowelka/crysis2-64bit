@@ -196,14 +196,28 @@ Command line flags:
 
 ## Building
 
+You need:
+
+- **WDK 7.1** for the VC90 x64 compiler. This is not nostalgia: the launcher has to link against
+  msvcr90 as its primary CRT so the process heap lands below the 4 GB line, or retail CrySystem's
+  truncated slab pointers come back corrupt. See the heap section above.
+- **Windows 10 SDK** for `rc.exe` and `mt.exe`, the resource compiler and manifest tool.
+- **An installed copy of the game**, because the build extracts cursor resources from its
+  `Crysis2.exe`.
+
+Edit the paths at the top of `build.ps1` to match your install, then run it:
 
 ```powershell
-# Requires WDK 7.1 (for the VC90 x64 compiler) at C:\WinDDK\7600.16385.1
 .\build.ps1
 ```
 
-`build.ps1` compiles `Main_min.cpp`, embeds the VC90 CRT manifest and copies the result into the
-game's `Bin64`. Adjust the paths at the top of the script to match your install.
+The script generates `CrySystem.lib` from `CrySystem.def`, extracts the cursors, compiles the
+resource script, builds `Main_min.cpp`, embeds the VC90 CRT manifest, and copies the result into
+the game's `Bin64`.
+
+Two files are deliberately absent from this repository and produced at build time instead:
+`CrySystem.lib`, which is derived from the game's own DLL, and the cursor `.cur` files, which are
+Crytek assets. Neither is ours to distribute.
 
 ## Known issues
 
