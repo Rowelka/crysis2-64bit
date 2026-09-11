@@ -425,6 +425,17 @@ static bool AddressIsMapped(ULONG_PTR addr)
 	return mbi.State == MEM_COMMIT;
 }
 
+// Reads one pointer-sized value, returning false instead of faulting on an unmapped page.
+static bool SafePeek(const void* at, ULONG_PTR* out)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!VirtualQuery(at, &mbi, sizeof(mbi))) return false;
+	if (mbi.State != MEM_COMMIT) return false;
+	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+	*out = *(const ULONG_PTR*)at;
+	return true;
+}
+
 static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 {
 	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -501,6 +512,24 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 		             names[i+1], (unsigned long long)regs[i+1],
 		             names[i+2], (unsigned long long)regs[i+2],
 		             names[i+3], (unsigned long long)regs[i+3], "\n");
+	}
+	// Who called in. The faulting instruction is often inside a system library that was
+	// simply handed something wrong; the frames above it name the code that did the handing.
+	n += sprintf(buf + n, "  callers       :%s", "\n");
+	{
+		const ULONG_PTR* sp = (const ULONG_PTR*)c->Rsp;
+		int shown = 0;
+		for (int i = 0; i < 256 && shown < 10; i++)
+		{
+			ULONG_PTR v = 0;
+			if (!SafePeek(&sp[i], &v)) break;
+			ULONG_PTR r = 0;
+			const char* m = ModuleAt(v, &r);
+			if (!m) continue;
+			n += sprintf(buf + n, "    [rsp+%04X] %s+0x%08llX%s", (unsigned)(i * 8), m,
+			             (unsigned long long)r, "\n");
+			shown++;
+		}
 	}
 	n += sprintf(buf + n, "%s", "\n");
 
@@ -688,8 +717,9 @@ static unsigned    g_arenaSeen     = 0;      // arena-sized requests observed
 // for. Nothing low is taken away, so the renderer is untouched - which is what made
 // -forcehighheap useless as a test.
 #define CRT_FREE_PTR_RVA 0x6EF6D0
+#define CRY_FREE_PTR_RVA 0x6EF6C0
 #define CRT_SIZE_PTR_RVA 0x6EF6D8
-#define ARENA_POOL_SLOTS 1024
+#define ARENA_POOL_SLOTS 2048
 
 // Arenas are spaced two slots apart, so no arena ends exactly where the next one begins.
 // The allocator decides which arena a pointer belongs to with `base <= p <= end`, end
@@ -711,6 +741,8 @@ typedef void   (*CrtFreeFn)(void* p);
 typedef size_t (*CrtSizeFn)(void* p);
 
 static CrtFreeFn g_origCrtFree = 0;
+static CrtFreeFn g_origCryFree = 0;
+static unsigned  g_arenaFreedElsewhere = 0;   // arenas released through CryFree, not CrtFree
 static CrtSizeFn g_origCrtSize = 0;
 static bool      g_arenaHigh   = false;
 static const char* g_highArenaMsg = "off";   // reported in the diagnostic file
@@ -718,33 +750,42 @@ static const char* g_highArenaMsg = "off";   // reported in the diagnostic file
 static unsigned char* g_arenaPool = 0;                  // reserved, ARENA_POOL_SLOTS * 0x80000
 static volatile LONG  g_arenaSlot[ARENA_POOL_SLOTS];    // 0 free, 1 in use
 static volatile LONG  g_arenaLive = 0;                  // arenas served and not yet freed
+static volatile LONG  g_arenaNext = 0;                  // next slot to hand out, never rewound
 static unsigned       g_arenaPeak = 0;
 static unsigned       g_arenaFull = 0;                  // times the pool had nothing left
 static unsigned       g_arenaFreed = 0;
 static unsigned       g_arenaSkipped = 0;      // arena-sized requests from anywhere else
 static const void*    g_arenaCallSite = 0;
 
+// Slots are handed out in order and never reused, even after the arena is freed.
+//
+// Reusing one deadlocked the engine: it keeps arenas on a chain it walks by address
+// ([arena+0x2010]), and handing back an address it already has on that chain can close the
+// chain into a ring. The walk then never ends - the thread stops answering, the engine's own
+// watchdog reports "Runaway thread", and the process is killed sixty seconds in. Addresses are
+// cheap here: the pool is reserved address space, and a session used 186 of 2048.
 static void* ArenaAlloc(void)
 {
 	if (!g_arenaPool) return 0;
-	for (unsigned i = 0; i < ARENA_POOL_SLOTS; i++)
-	{
-		if (g_arenaSlot[i]) continue;
-		if (InterlockedCompareExchange(&g_arenaSlot[i], 1, 0) != 0) continue;
 
-		void* p = VirtualAlloc(g_arenaPool + (size_t)i * ARENA_SLOT_STRIDE,
-		                       BUCKET_ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
-		if (!p)
-		{
-			InterlockedExchange(&g_arenaSlot[i], 0);
-			break;
-		}
-		const LONG live = InterlockedIncrement(&g_arenaLive);
-		if ((unsigned)live > g_arenaPeak) g_arenaPeak = (unsigned)live;
-		return p;
+	const LONG slot = InterlockedIncrement(&g_arenaNext) - 1;
+	if (slot < 0 || slot >= (LONG)ARENA_POOL_SLOTS)
+	{
+		g_arenaFull++;
+		return 0;
 	}
-	g_arenaFull++;
-	return 0;
+
+	void* p = VirtualAlloc(g_arenaPool + (size_t)slot * ARENA_SLOT_STRIDE,
+	                       BUCKET_ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+	if (!p)
+	{
+		g_arenaFull++;
+		return 0;
+	}
+	InterlockedExchange(&g_arenaSlot[slot], 1);
+	const LONG live = InterlockedIncrement(&g_arenaLive);
+	if ((unsigned)live > g_arenaPeak) g_arenaPeak = (unsigned)live;
+	return p;
 }
 
 static bool ArenaOwns(void* p, unsigned* slotOut)
@@ -764,13 +805,31 @@ static void ProxyCrtFree(void* p)
 	unsigned slot = 0;
 	if (ArenaOwns(p, &slot))
 	{
-		VirtualFree(p, BUCKET_ARENA_BYTES, MEM_DECOMMIT);
-		InterlockedExchange(&g_arenaSlot[slot], 0);
+		// The pages stay committed on purpose. Decommitting them turns a stale pointer into
+		// an access violation, and the allocator is not the only one holding pointers into an
+		// arena - the renderer reads through them too. Real malloc does not unmap freed blocks
+		// either, so keeping them mapped is the behaviour being imitated, not a workaround.
+		InterlockedExchange(&g_arenaSlot[slot], 2);   // retired, not reusable
 		InterlockedDecrement(&g_arenaLive);
 		g_arenaFreed++;
 		return;
 	}
 	g_origCrtFree(p);
+}
+
+// CryFree, the entry point the rest of the engine uses. An arena should never arrive here,
+// but if one does, it must not be handed to the real CRT - that block was never its.
+static void ProxyCryFree(void* p)
+{
+	unsigned slot = 0;
+	if (ArenaOwns(p, &slot))
+	{
+		g_arenaFreedElsewhere++;
+		InterlockedExchange(&g_arenaSlot[slot], 2);   // retired, not reusable
+		InterlockedDecrement(&g_arenaLive);
+		return;
+	}
+	g_origCryFree(p);
 }
 
 static size_t ProxyCrtSize(void* p)
@@ -806,7 +865,8 @@ static void* ProxyCrtMalloc(size_t size)
 				if (g_arenaSeen <= 3 || (g_arenaSeen % 64) == 0)
 				{
 					char hl[160];
-					int k = sprintf(hl, "  arena #%u -> 0x%016llX  %s\n", g_arenaSeen,
+					int k = sprintf(hl, "  arena #%u (slot %d/%u) -> 0x%016llX  %s\n",
+			                g_arenaSeen, (int)g_arenaNext, (unsigned)ARENA_POOL_SLOTS,
 					                (unsigned long long)(ULONG_PTR)h,
 					                ((ULONG_PTR)h >= (ULONG_PTR)0x100000000) ? "ABOVE 4GB" : "still low");
 					AppendFaultLog(hl, (unsigned long)k);
@@ -870,6 +930,7 @@ static const char* InstallHighArena(void)
 	CrtMallocFn* mslot = (CrtMallocFn*)(base + CRT_MALLOC_PTR_RVA);
 	CrtFreeFn*   fslot = (CrtFreeFn*)(base + CRT_FREE_PTR_RVA);
 	CrtSizeFn*   sslot = (CrtSizeFn*)(base + CRT_SIZE_PTR_RVA);
+	CrtFreeFn*   gslot = (CrtFreeFn*)(base + CRY_FREE_PTR_RVA);
 
 	EnsureCrtTable(base);
 	if (!*mslot || !*fslot || !*sslot) return "crt table incomplete";
@@ -887,12 +948,14 @@ static const char* InstallHighArena(void)
 	g_origCrtMalloc = *mslot;
 	g_origCrtFree   = *fslot;
 	g_origCrtSize   = *sslot;
+	if (*gslot) { g_origCryFree = *gslot; }
 
 	DWORD oldProt = 0;
 	if (!VirtualProtect(mslot, 8 * 4, PAGE_READWRITE, &oldProt)) return "VirtualProtect failed";
 	*mslot = ProxyCrtMalloc;
 	*fslot = ProxyCrtFree;
 	*sslot = ProxyCrtSize;
+	if (g_origCryFree) *gslot = ProxyCryFree;
 	VirtualProtect(mslot, 8 * 4, oldProt, &oldProt);
 
 	g_arenaCallSite = (const void*)(base + ARENA_CALL_SITE_RVA);
@@ -1670,6 +1733,70 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	fclose(f);
 }
 
+// Where the main thread is standing when it stops answering.
+//
+// The engine's watchdog reports "Runaway thread" and kills the process about twenty seconds
+// after the counters flatten, which leaves nothing to look at afterwards. Taking a dump from
+// outside needs administrator rights; a process can always suspend its own threads, so the
+// watcher does it here: freeze the main thread, read RIP, and walk its stack for return
+// addresses that land inside a loaded module. That is enough to name the function that is
+// spinning.
+static HANDLE g_mainThread = 0;
+
+static void ReportMainThreadStack(const char* why)
+{
+	if (!g_mainThread) return;
+
+	char buf[2048];
+	int n = sprintf(buf, "=== main thread stalled: %s ===\n", why);
+
+	if (SuspendThread(g_mainThread) == (DWORD)-1)
+	{
+		n += sprintf(buf + n, "  could not suspend the thread\n\n");
+		AppendFaultLog(buf, (unsigned long)n);
+		return;
+	}
+
+	CONTEXT ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+	if (GetThreadContext(g_mainThread, &ctx))
+	{
+		ULONG_PTR rva = 0;
+		const char* mod = ModuleAt((ULONG_PTR)ctx.Rip, &rva);
+		n += sprintf(buf + n, "  rip : %s+0x%08llX\n", mod ? mod : "(unknown)",
+		             (unsigned long long)rva);
+		n += sprintf(buf + n, "  rsp : 0x%016llX  rbx=0x%016llX  rcx=0x%016llX  rdx=0x%016llX\n",
+		             (unsigned long long)ctx.Rsp, (unsigned long long)ctx.Rbx,
+		             (unsigned long long)ctx.Rcx, (unsigned long long)ctx.Rdx);
+
+		// A frame pointer chain is not available here, so the stack is simply scanned: any value
+		// that points into a loaded module is a plausible return address. False positives are
+		// possible, but the repeated ones name the loop.
+		const ULONG_PTR* sp = (const ULONG_PTR*)ctx.Rsp;
+		int shown = 0;
+		for (int i = 0; i < 256 && shown < 12; i++)
+		{
+			ULONG_PTR v = 0;
+			if (!SafePeek(&sp[i], &v)) break;
+			ULONG_PTR r = 0;
+			const char* m = ModuleAt(v, &r);
+			if (!m) continue;
+			n += sprintf(buf + n, "  [rsp+%04X] %s+0x%08llX\n", (unsigned)(i * 8), m,
+			             (unsigned long long)r);
+			shown++;
+		}
+	}
+	else
+	{
+		n += sprintf(buf + n, "  GetThreadContext failed\n");
+	}
+
+	ResumeThread(g_mainThread);
+	n += sprintf(buf + n, "\n");
+	AppendFaultLog(buf, (unsigned long)n);
+}
+
 // Reports where the allocator's own pointers actually are, and whether the corrected
 // instructions are reached at all. Enabled with -sitewatch.
 //
@@ -1712,6 +1839,23 @@ static DWORD WINAPI SiteWatchThread(LPVOID)
 			if (!h) continue;
 			used++;
 			if (h >= 0x100000000ull) above++;
+		}
+
+		// A stall is easier to see than a hang: this counter normally climbs by tens of
+		// thousands per second, so a few dozen means the thread has effectively stopped.
+		if (g_siteHits && tick > 8)
+		{
+			static unsigned long long lastWalk = 0;
+			static int stalledTicks = 0;
+			static bool reported = false;
+			const unsigned long long walk = cur[3];
+			if (walk - lastWalk < 1000) stalledTicks++; else stalledTicks = 0;
+			lastWalk = walk;
+			if (stalledTicks >= 2 && !reported)
+			{
+				reported = true;
+				ReportMainThreadStack("list-walk counter stopped climbing");
+			}
 		}
 
 		if (memcmp(cur, prev, sizeof(cur)) != 0)
@@ -1932,6 +2076,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		HANDLE th = CreateThread(NULL, 0, MovieStatsThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
+
+	// Keep a handle to this thread: it is the one the engine's watchdog watches, and the one
+	// whose stack is worth reading when everything stops.
+	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+	                GetCurrentProcess(), &g_mainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
 	// Diagnostic: follow the allocator globals and the trampoline counters while the game runs.
 	if (lpCmdLine && strstr(lpCmdLine, "-sitewatch"))
