@@ -386,15 +386,20 @@ static void DiagLine(FILE* f, const char* fmt, ...)
 #define MAX_FAULT_RECORDS 32
 static volatile long g_faultsLogged = 0;
 
-static void AppendFaultLog(const char* text, unsigned long len)
+static void AppendTextFile(const char* path, const char* text, unsigned long len)
 {
-	HANDLE h = CreateFileA("launcher_faults.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+	HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
 	                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (h == INVALID_HANDLE_VALUE) return;
 	DWORD written = 0;
 	SetFilePointer(h, 0, NULL, FILE_END);
 	WriteFile(h, text, len, &written, NULL);
 	CloseHandle(h);
+}
+
+static void AppendFaultLog(const char* text, unsigned long len)
+{
+	AppendTextFile("launcher_faults.txt", text, len);
 }
 
 // Names the module an address belongs to, without pulling in psapi: the allocation base of a
@@ -423,13 +428,29 @@ static bool AddressIsMapped(ULONG_PTR addr)
 static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 {
 	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
-	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
-	if (ep->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
 	if (g_faultsLogged >= MAX_FAULT_RECORDS) return EXCEPTION_CONTINUE_SEARCH;
 
-	const ULONG_PTR addr = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
-	const ULONG_PTR op   = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[0];
-	if (addr >= (ULONG_PTR)0x100000000) return EXCEPTION_CONTINUE_SEARCH;   // not this signature
+	// Every way the process can die hard, not only the truncation signature.
+	//
+	// Narrowing this to access violations on low addresses was right while that was the one
+	// failure being hunted, but it made every other death invisible: the engine went down with a
+	// divide by zero inside the allocator and neither log said a word about where. A handler
+	// that only sees what it already expects is not a detector.
+	const DWORD code = ep->ExceptionRecord->ExceptionCode;
+	const char* kind =
+		code == EXCEPTION_ACCESS_VIOLATION      ? "access violation" :
+		code == EXCEPTION_INT_DIVIDE_BY_ZERO    ? "integer divide by zero" :
+		code == EXCEPTION_ILLEGAL_INSTRUCTION   ? "illegal instruction" :
+		code == EXCEPTION_PRIV_INSTRUCTION      ? "privileged instruction" :
+		code == EXCEPTION_STACK_OVERFLOW        ? "stack overflow" :
+		code == 0xC0000374                      ? "heap corruption" :
+		code == EXCEPTION_INT_OVERFLOW          ? "integer overflow" : 0;
+	if (!kind) return EXCEPTION_CONTINUE_SEARCH;
+
+	const bool isAV = (code == EXCEPTION_ACCESS_VIOLATION &&
+	                   ep->ExceptionRecord->NumberParameters >= 2);
+	const ULONG_PTR addr = isAV ? (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+	const ULONG_PTR op   = isAV ? (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[0] : 0;
 
 	InterlockedIncrement(&g_faultsLogged);
 
@@ -448,23 +469,27 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 	ULONG_PTR rva = 0;
 	const char* mod = ModuleAt((ULONG_PTR)c->Rip, &rva);
 
-	n += sprintf(buf + n, "=== access violation on a low address ===%s", "\n");
+	n += sprintf(buf + n, "=== %s ===%s", kind, "\n");
 	n += sprintf(buf + n, "  faulting code : %s+0x%08llX%s",
 	             mod ? mod : "(unknown)", (unsigned long long)rva, "\n");
-	n += sprintf(buf + n, "  operation     : %s%s",
-	             op == 0 ? "read" : (op == 1 ? "write" : "execute"), "\n");
-	n += sprintf(buf + n, "  address       : 0x%016llX (%s)%s", (unsigned long long)addr,
-	             addr < 0x10000 ? "null-ish, probably not truncation" : "unmapped low address",
-	             "\n");
+	if (isAV)
+	{
+		n += sprintf(buf + n, "  operation     : %s%s",
+		             op == 0 ? "read" : (op == 1 ? "write" : "execute"), "\n");
+		n += sprintf(buf + n, "  address       : 0x%016llX (%s)%s", (unsigned long long)addr,
+		             addr >= 0x100000000 ? "high address, mapped or not" :
+		             (addr < 0x10000 ? "null-ish, probably not truncation" : "unmapped low address"),
+		             "\n");
+	}
 
 	// The most useful line: a register whose low half equals the faulting address but whose top
 	// half is still intact is the original pointer, and names what was truncated on the way in.
-	for (int i = 0; i < 16; ++i) {
+	for (int i = 0; i < 16 && addr; ++i) {
 		if ((regs[i] & 0xFFFFFFFF) == (addr & 0xFFFFFFFF) && (regs[i] >> 32) != 0)
 			n += sprintf(buf + n, "  intact copy   : %s = 0x%016llX  <- pointer before truncation%s",
 			             names[i], (unsigned long long)regs[i], "\n");
 	}
-	for (int i = 0; i < 16; ++i) {
+	for (int i = 0; i < 16 && addr; ++i) {
 		if (regs[i] == addr)
 			n += sprintf(buf + n, "  held in       : %s%s", names[i], "\n");
 	}
@@ -504,6 +529,33 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 typedef void  (*CrtTableInitFn)(void);
 typedef void* (*CryMallocFn)(size_t size, size_t* allocated);
 
+// Low address space held back so that one allocation has to go above the 4 GB line.
+//
+// The blocks are remembered rather than simply reserved, because the whole point is to let go
+// of them the moment the arena has been allocated - see the note in ProxyCryMalloc.
+#define MAX_LOW_BLOCKS 128
+static LPVOID   g_lowBlocks[MAX_LOW_BLOCKS];
+static unsigned g_lowBlockCount = 0;
+static bool     g_lowHeld = false;
+
+static void ReleaseLowAddressSpace(void)
+{
+	if (!g_lowHeld) return;
+	g_lowHeld = false;
+	for (unsigned i = 0; i < g_lowBlockCount; i++)
+	{
+		if (g_lowBlocks[i]) VirtualFree(g_lowBlocks[i], 0, MEM_RELEASE);
+		g_lowBlocks[i] = 0;
+	}
+	g_lowBlockCount = 0;
+}
+
+// Threshold for -highslab: allocations of at least this many bytes are served from above the
+// 4 GB line instead of from the engine's own heap. Zero disables it.
+static SIZE_T   g_highThreshold = 0;
+static unsigned g_highTaken  = 0;      // large allocations moved above 4 GB
+static unsigned g_highMissed = 0;      // large allocations that could not be moved
+
 static CryMallocFn   g_origCryMalloc = 0;
 static volatile long g_allocLogged = 0;
 
@@ -518,6 +570,9 @@ static void* ProxyCryMalloc(size_t size, size_t* allocated)
 		AppendFaultLog(ask, (unsigned long)m);
 	}
 
+	// No squeeze here. This is the wrong door: the allocator takes its arena through
+	// CrySystemCrtMalloc, not through CryMalloc - see ProxyCrtMalloc below. Pushing what
+	// arrives here above the 4 GB line moved memory that had nothing to do with the bug.
 	void* p = g_origCryMalloc(size, allocated);
 
 	// Only the interesting ones: every failure, and the large blocks the pools are made of.
@@ -563,18 +618,30 @@ static size_t LargestFreeBlockBelow4GB(size_t* totalFreeOut)
 	return largest;
 }
 
+static bool g_crtTableReady = false;
+
+// Filling the table has to happen exactly once. Making it conditional on the slot being
+// empty leaves the table unfilled and the game dies fifteen seconds in; calling it again
+// after a proxy is installed puts the original pointer back and quietly removes the proxy.
+static void EnsureCrtTable(unsigned char* base)
+{
+	if (g_crtTableReady) return;
+	((CrtTableInitFn)(base + CRT_TABLE_INIT_RVA))();
+	g_crtTableReady = true;
+}
+
 static const char* InstallAllocProxy(void)
 {
 	HMODULE cs = GetModuleHandleA("CrySystem.dll");
 	if (!cs) return "CrySystem not loaded";
 	unsigned char* base = (unsigned char*)cs;
 
-	// Populate the table first, so the entry we read is the real one.
-	((CrtTableInitFn)(base + CRT_TABLE_INIT_RVA))();
-
 	CryMallocFn* slot = (CryMallocFn*)(base + CRYMALLOC_PTR_RVA);
-	if (!*slot) return "allocator pointer still empty";
 	if (*slot == ProxyCryMalloc) return "already installed";
+
+	// Populate the table, so the entry read below is the real one.
+	EnsureCrtTable(base);
+	if (!*slot) return "allocator pointer still empty";
 
 	g_origCryMalloc = *slot;
 
@@ -584,6 +651,261 @@ static const char* InstallAllocProxy(void)
 	VirtualProtect(slot, sizeof(*slot), oldProt, &oldProt);
 	return "installed";
 }
+
+// The arena the bucket allocator runs on never came from CryMalloc.
+//
+// CrySystem fills a small table of allocation entry points from its own exports (the function
+// at RVA 0x0369E0): CryMalloc lands at 0x6EF6A8, CryRealloc at 0x6EF6B8, CryGetMemSize at
+// 0x6EF6C0, and CrySystemCrtMalloc at 0x6EF6C8. That last one is a jump straight to
+// MSVCR90!malloc, and it is what the bucket allocator calls to build its 0x80000-byte arena
+// (the call at 0xA1922). Requests over 0x200 bytes take the same route (0xA12CE); smaller ones
+// are served out of the arena, which is the whole point of the thing.
+//
+// So proxying CryMalloc - which is what -highslab did until now - never saw an arena being
+// created at all. The 512 KB blocks it caught and pushed above the 4 GB line belonged to
+// something else entirely, the allocator's own memory stayed low the whole time, and the
+// pointer corrections had nothing to correct. That is the answer to why -enginefix made no
+// difference: the bug it fixes was never given a chance to fire.
+#define CRT_MALLOC_PTR_RVA 0x6EF6C8
+#define BUCKET_ARENA_BYTES 0x80000
+
+typedef void* (*CrtMallocFn)(size_t size);
+static CrtMallocFn g_origCrtMalloc = 0;
+static bool        g_arenaExact    = true;   // match the arena size exactly, not a threshold
+static unsigned    g_arenaSeen     = 0;      // arena-sized requests observed
+
+// Serving every arena from above the 4 GB line, instead of squeezing one of them up there.
+//
+// The squeeze only works once. It lets go of the low address space the moment the first arena is
+// taken, so arena number two and the hundred after it come straight back down - watching the
+// globals while the game runs shows exactly that: one arena high, then 0x4BD16BE0 for the next
+// minute. A condition that holds for a fraction of a second proves nothing either way.
+//
+// So the arena is served directly instead. The allocator gets its 0x80000-byte block like any
+// other, only from a region reserved above the line; CrySystemCrtFree and CrySystemCrtSize are
+// hooked alongside it so the block behaves like a CRT one for its whole life. That was what went
+// wrong the last time this was tried: memory handed over without the rest of its life accounted
+// for. Nothing low is taken away, so the renderer is untouched - which is what made
+// -forcehighheap useless as a test.
+#define CRT_FREE_PTR_RVA 0x6EF6D0
+#define CRT_SIZE_PTR_RVA 0x6EF6D8
+#define ARENA_POOL_SLOTS 1024
+
+// Arenas are spaced two slots apart, so no arena ends exactly where the next one begins.
+// The allocator decides which arena a pointer belongs to with `base <= p <= end`, end
+// inclusive, and real malloc never hands out blocks that touch - a pool that does would be
+// asking a question the engine was never written to answer.
+#define ARENA_SLOT_STRIDE (BUCKET_ARENA_BYTES * 2)
+
+// The one call site that builds an arena: CrySystem RVA 0xA1922, and the instruction is
+// "call qword ptr [rip+disp32]" - six bytes, so the return address is 0xA1928. Requests
+// of exactly the arena size also arrive from 0xA12CE, which is the ordinary path for any
+// block over 0x200 bytes; serving those from the pool as well would move memory that has
+// nothing to do with the experiment.
+#define ARENA_CALL_SITE_RVA 0x0A1928
+
+extern "C" void* _ReturnAddress(void);
+#pragma intrinsic(_ReturnAddress)
+
+typedef void   (*CrtFreeFn)(void* p);
+typedef size_t (*CrtSizeFn)(void* p);
+
+static CrtFreeFn g_origCrtFree = 0;
+static CrtSizeFn g_origCrtSize = 0;
+static bool      g_arenaHigh   = false;
+static const char* g_highArenaMsg = "off";   // reported in the diagnostic file
+
+static unsigned char* g_arenaPool = 0;                  // reserved, ARENA_POOL_SLOTS * 0x80000
+static volatile LONG  g_arenaSlot[ARENA_POOL_SLOTS];    // 0 free, 1 in use
+static volatile LONG  g_arenaLive = 0;                  // arenas served and not yet freed
+static unsigned       g_arenaPeak = 0;
+static unsigned       g_arenaFull = 0;                  // times the pool had nothing left
+static unsigned       g_arenaFreed = 0;
+static unsigned       g_arenaSkipped = 0;      // arena-sized requests from anywhere else
+static const void*    g_arenaCallSite = 0;
+
+static void* ArenaAlloc(void)
+{
+	if (!g_arenaPool) return 0;
+	for (unsigned i = 0; i < ARENA_POOL_SLOTS; i++)
+	{
+		if (g_arenaSlot[i]) continue;
+		if (InterlockedCompareExchange(&g_arenaSlot[i], 1, 0) != 0) continue;
+
+		void* p = VirtualAlloc(g_arenaPool + (size_t)i * ARENA_SLOT_STRIDE,
+		                       BUCKET_ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+		if (!p)
+		{
+			InterlockedExchange(&g_arenaSlot[i], 0);
+			break;
+		}
+		const LONG live = InterlockedIncrement(&g_arenaLive);
+		if ((unsigned)live > g_arenaPeak) g_arenaPeak = (unsigned)live;
+		return p;
+	}
+	g_arenaFull++;
+	return 0;
+}
+
+static bool ArenaOwns(void* p, unsigned* slotOut)
+{
+	if (!g_arenaPool || !p) return false;
+	const ULONG_PTR a = (ULONG_PTR)p;
+	const ULONG_PTR lo = (ULONG_PTR)g_arenaPool;
+	const ULONG_PTR hi = lo + (ULONG_PTR)ARENA_POOL_SLOTS * ARENA_SLOT_STRIDE;
+	if (a < lo || a >= hi) return false;
+	if (((a - lo) % ARENA_SLOT_STRIDE) != 0) return false;   // inside an arena, not its start
+	*slotOut = (unsigned)((a - lo) / ARENA_SLOT_STRIDE);
+	return true;
+}
+
+static void ProxyCrtFree(void* p)
+{
+	unsigned slot = 0;
+	if (ArenaOwns(p, &slot))
+	{
+		VirtualFree(p, BUCKET_ARENA_BYTES, MEM_DECOMMIT);
+		InterlockedExchange(&g_arenaSlot[slot], 0);
+		InterlockedDecrement(&g_arenaLive);
+		g_arenaFreed++;
+		return;
+	}
+	g_origCrtFree(p);
+}
+
+static size_t ProxyCrtSize(void* p)
+{
+	unsigned slot = 0;
+	if (ArenaOwns(p, &slot)) return BUCKET_ARENA_BYTES;
+	return g_origCrtSize(p);
+}
+
+static void* ProxyCrtMalloc(size_t size)
+{
+	if (size == BUCKET_ARENA_BYTES)
+	{
+		g_arenaSeen++;
+		if (g_arenaHigh && _ReturnAddress() != g_arenaCallSite)
+		{
+			// Report the first one. An off-by-one in the return address silently turns every
+			// arena away, and the run then looks exactly like a run with the flag switched off.
+			if (++g_arenaSkipped == 1)
+			{
+				char sk[160];
+				int k = sprintf(sk, "  arena-sized request from 0x%016llX, expected 0x%016llX\n",
+				                (unsigned long long)(ULONG_PTR)_ReturnAddress(),
+				                (unsigned long long)(ULONG_PTR)g_arenaCallSite);
+				AppendFaultLog(sk, (unsigned long)k);
+			}
+		}
+		else if (g_arenaHigh)
+		{
+			void* h = ArenaAlloc();
+			if (h)
+			{
+				if (g_arenaSeen <= 3 || (g_arenaSeen % 64) == 0)
+				{
+					char hl[160];
+					int k = sprintf(hl, "  arena #%u -> 0x%016llX  %s\n", g_arenaSeen,
+					                (unsigned long long)(ULONG_PTR)h,
+					                ((ULONG_PTR)h >= (ULONG_PTR)0x100000000) ? "ABOVE 4GB" : "still low");
+					AppendFaultLog(hl, (unsigned long)k);
+				}
+				return h;
+			}
+		}
+	}
+
+	// Squeeze for exactly one allocation - the arena - and let go immediately afterwards, so
+	// the renderer finds the low address space back where it expects it.
+	const bool squeeze = (g_lowHeld && (g_arenaExact ? (size == BUCKET_ARENA_BYTES)
+	                                                 : (g_highThreshold && size >= g_highThreshold)));
+
+	void* p = g_origCrtMalloc(size);
+
+	if (squeeze)
+	{
+		ReleaseLowAddressSpace();
+		if (p)
+		{
+			const bool high = ((ULONG_PTR)p >= (ULONG_PTR)0x100000000);
+			if (high) g_highTaken++; else g_highMissed++;
+			char hl[160];
+			int k = sprintf(hl, "  arena   %9u bytes -> 0x%016llX  %s\n",
+			                (unsigned)size, (unsigned long long)(ULONG_PTR)p,
+			                high ? "ABOVE 4GB" : "still low");
+			AppendFaultLog(hl, (unsigned long)k);
+		}
+	}
+	return p;
+}
+
+static const char* InstallArenaProxy(void)
+{
+	HMODULE cs = GetModuleHandleA("CrySystem.dll");
+	if (!cs) return "CrySystem not loaded";
+	unsigned char* base = (unsigned char*)cs;
+
+	CrtMallocFn* slot = (CrtMallocFn*)(base + CRT_MALLOC_PTR_RVA);
+	if (*slot == ProxyCrtMalloc) return "already installed";
+
+	EnsureCrtTable(base);
+	if (!*slot) return "crt allocator pointer still empty";
+
+	g_origCrtMalloc = *slot;
+
+	DWORD oldProt = 0;
+	if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProt)) return "VirtualProtect failed";
+	*slot = ProxyCrtMalloc;
+	VirtualProtect(slot, sizeof(*slot), oldProt, &oldProt);
+	return "installed";
+}
+
+static const char* InstallHighArena(void)
+{
+	HMODULE cs = GetModuleHandleA("CrySystem.dll");
+	if (!cs) return "CrySystem not loaded";
+	unsigned char* base = (unsigned char*)cs;
+
+	CrtMallocFn* mslot = (CrtMallocFn*)(base + CRT_MALLOC_PTR_RVA);
+	CrtFreeFn*   fslot = (CrtFreeFn*)(base + CRT_FREE_PTR_RVA);
+	CrtSizeFn*   sslot = (CrtSizeFn*)(base + CRT_SIZE_PTR_RVA);
+
+	EnsureCrtTable(base);
+	if (!*mslot || !*fslot || !*sslot) return "crt table incomplete";
+
+	// A gigabyte of address space, not of memory: pages are committed one arena at a time and
+	// given back on free, so the cost is what the allocator actually holds.
+	for (ULONGLONG at = 0x200000000ULL; at < 0x1000000000ULL; at += 0x40000000ULL)
+	{
+		LPVOID p = VirtualAlloc((LPVOID)at, (SIZE_T)ARENA_POOL_SLOTS * ARENA_SLOT_STRIDE,
+		                        MEM_RESERVE, PAGE_READWRITE);
+		if (p) { g_arenaPool = (unsigned char*)p; break; }
+	}
+	if (!g_arenaPool) return "no address space above 4 GB";
+
+	g_origCrtMalloc = *mslot;
+	g_origCrtFree   = *fslot;
+	g_origCrtSize   = *sslot;
+
+	DWORD oldProt = 0;
+	if (!VirtualProtect(mslot, 8 * 4, PAGE_READWRITE, &oldProt)) return "VirtualProtect failed";
+	*mslot = ProxyCrtMalloc;
+	*fslot = ProxyCrtFree;
+	*sslot = ProxyCrtSize;
+	VirtualProtect(mslot, 8 * 4, oldProt, &oldProt);
+
+	g_arenaCallSite = (const void*)(base + ARENA_CALL_SITE_RVA);
+	g_arenaHigh = true;
+
+	static char msg[96];
+	sprintf(msg, "pool at 0x%llX, %u arenas of %u KB, %u KB apart",
+	        (unsigned long long)(ULONG_PTR)g_arenaPool, (unsigned)ARENA_POOL_SLOTS,
+	        (unsigned)(BUCKET_ARENA_BYTES / 1024), (unsigned)(ARENA_SLOT_STRIDE / 1024));
+	return msg;
+}
+
+
 
 // Site 1 - the head of the allocator's free-page list, widened in place.
 //
@@ -622,15 +944,322 @@ static bool WriteBytes(unsigned char* at, const unsigned char* src, unsigned lon
 // a value that was never a pointer, and applying them together broke startup on a machine where
 // it had been working. They are not kept behind a flag either - a switch that breaks the game is
 // not a feature. If they are ever needed, the reasoning and the addresses are in docs/FINDINGS.md.
+
+// Somewhere to put instructions that do not fit where they belong.
+//
+// Two of the four truncations cannot be corrected in place: the right instruction is one byte
+// longer than the wrong one, the function ends a few bytes later, and the byte after that is
+// the target of a branch. So those bytes are replaced by a jump into a region allocated next to
+// CrySystem, the corrected code sits there, and it jumps back.
+//
+// The region has to be within 2 GB of the module, because a relative jump only carries a signed
+// 32-bit displacement. Hence the search outward from the module base instead of letting the
+// system choose an address.
+static unsigned char* g_cave     = 0;
+static size_t         g_caveUsed = 0;
+static const size_t   kCaveSize  = 0x1000;
+
+static unsigned char* AllocCaveNear(void* anchor)
+{
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	const ULONG_PTR gran = (ULONG_PTR)si.dwAllocationGranularity;
+	const ULONG_PTR base = (ULONG_PTR)anchor & ~(gran - 1);
+
+	for (ULONG_PTR off = gran; off < 0x30000000; off += gran)
+	{
+		void* p = VirtualAlloc((LPVOID)(base + off), kCaveSize,
+		                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (p) return (unsigned char*)p;
+		if (base > off)
+		{
+			p = VirtualAlloc((LPVOID)(base - off), kCaveSize,
+			                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (p) return (unsigned char*)p;
+		}
+	}
+	return 0;
+}
+
+// Writes "jmp rel32" at 'from' to 'to', padding the rest of 'len' with nop.
+static bool WriteJump(unsigned char* from, const unsigned char* to, size_t len)
+{
+	if (len < 5) return false;
+	const LONGLONG delta = (LONGLONG)(to - (from + 5));
+	if (delta > 0x7FFFFFF0 || delta < -0x7FFFFFF0) return false;
+
+	unsigned char buf[16];
+	buf[0] = 0xE9;
+	*(LONG*)(buf + 1) = (LONG)delta;
+	for (size_t i = 5; i < len; i++) buf[i] = 0x90;
+	return WriteBytes(from, buf, (unsigned long)len);
+}
+
+// Sites 3 and 4, the two that need a trampoline.
+//
+// Site 3, taking a block off the free list (0x0A14A0):
+//     mov eax, dword ptr [rsi]                   <- reads the "next" pointer, half of it
+//     mov dword ptr [r13+rbp*8+0x6F91A0], eax    <- stores it back as the new head, half again
+// The head itself is read correctly one instruction earlier, with a 64-bit load. Only the walk
+// through the list is narrow, so the first block comes back intact and the second is garbage.
+//
+// Site 4, publishing the arena pointer (0x0A1A70):
+//     mov dword ptr [rip+0x6578ba], ecx          <- 32-bit store into global 0x6F9330
+// which the allocator then reads back 64 bits wide at 0x0A188D. The register holding the
+// return value is live across this instruction, so the trampoline uses r11, which is not.
+// Site 5, publishing the arena base (0x0A1A2A):
+//     mov dword ptr [rip+0x657760], ebp        <- 32-bit store into global 0x6F9190
+// read back fifteen instructions later, in the same function, as a full pointer:
+//     mov r11, qword ptr [rip+0x657774]        <- at 0x0A1A15
+// r10 is dead here: it was loaded at 0x0A19FC and last used by the call at 0x0A1A0E.
+#define SITE3_RVA 0x0A14A0
+#define SITE4_RVA 0x0A1A70
+#define SITE5_RVA 0x0A1A2A
+#define GLOBAL_ARENA_RVA 0x6F9330
+#define GLOBAL_BASE_RVA  0x6F9190
+
+static const unsigned char kSite3Expect[] = {
+	0x8B, 0x06,                                       // mov eax, [rsi]
+	0x41, 0x89, 0x84, 0xED, 0xA0, 0x91, 0x6F, 0x00    // mov [r13+rbp*8+0x6F91A0], eax
+};
+static const unsigned char kSite4Expect[] = {
+	0x89, 0x0D, 0xBA, 0x78, 0x65, 0x00                // mov [rip+0x6578BA], ecx
+};
+static const unsigned char kSite5Expect[] = {
+	0x89, 0x2D, 0x60, 0x77, 0x65, 0x00                // mov [rip+0x657760], ebp
+};
+
+// Whether the corrected code is ever reached.
+//
+// "The patch was applied" and "the patched instruction runs" are two different claims, and only
+// the first one has been checked so far. Each trampoline body begins with a counter, so the
+// second one can be read off at any time - see SiteWatchThread.
+//
+// The flags register is saved around the increment. The instructions being replaced are plain
+// stores that leave flags alone, and whatever follows them may still depend on a comparison
+// made further back.
+#define CAVE_COUNTERS_OFF 0xF00
+static unsigned long long* g_siteHits = 0;      // [0] list walk, [1] arena, [2] base
+
+static size_t EmitHitCounter(unsigned char* buf, unsigned char* liveAddr, unsigned long long* counter)
+{
+	size_t n = 0;
+	buf[n++] = 0x9C;                                        // pushfq
+	buf[n++] = 0x48; buf[n++] = 0xFF; buf[n++] = 0x05;      // inc qword ptr [rip+rel32]
+	const LONG rel = (LONG)((unsigned char*)counter - (liveAddr + n + 4));
+	memcpy(buf + n, &rel, 4); n += 4;
+	buf[n++] = 0x9D;                                        // popfq
+	return n;
+}
+
+// Which corrections to apply, one bit per site: -enginefix turns on all eight,
+// -enginefix:1F only sites 1 to 5, -enginefix:20 only site 6, and so on.
+//
+// Bisecting by hand means a rebuild per guess; this makes it a command line away. The order
+// is the order they were found: 1 slab store, 2 free-list store, 3 list walk, 4 arena
+// cursor, 5 arena base, 6 second free-list store, 7 narrow read plus cursor, 8 cursor from
+// the other end.
+static unsigned g_fixMask = 0xFF;
+
+#define FIX_SITE(n) ((g_fixMask & (1u << ((n) - 1))) != 0)
+
+// Sites 6, 7 and 8, found by auditing every instruction that touches these globals instead of
+// searching one function at a time.
+//
+// That audit is the reason to trust the set now: it lists all 44 accesses with their widths, and
+// after these three the only remaining 32-bit ones are counters that are written and read at 32
+// bits consistently. Patching five of eight was worse than patching none - half the pointers
+// full, half truncated, and the allocator walking between them.
+//
+// Site 6 (0x0A1592), the second store into the array of free-list heads, in the function that
+// puts a block back:
+//     mov rax, qword ptr [r13+rbx*8+0x6F91A0]    <- read at 0x0A1586, 64 bits
+//     mov dword ptr [r13+rbx*8+0x6F91A0], r12d   <- write, 32 bits
+// Same shape as site 2, and missed for the same reason: the search that found site 2 stopped at
+// one function. REX 45 -> 4D.
+#define SITE6_RVA 0x0A1592
+static const unsigned char kSite6Expect[]  = { 0x45, 0x89, 0xA4, 0xDD, 0xA0, 0x91, 0x6F, 0x00 };
+static const unsigned char kSite6Patched[] = { 0x4D, 0x89, 0xA4, 0xDD, 0xA0, 0x91, 0x6F, 0x00 };
+
+// Site 8 (0x0A18FE), the arena cursor published from the other end of the allocator, read back
+// 64 bits wide three instructions earlier at 0x0A18F3. The instruction already carries a REX
+// prefix because it uses r8d, so setting W costs nothing: 44 -> 4C.
+#define SITE8_RVA 0x0A18FE
+static const unsigned char kSite8Expect[]  = { 0x44, 0x89, 0x05, 0x2B, 0x7A, 0x65, 0x00 };
+static const unsigned char kSite8Patched[] = { 0x4C, 0x89, 0x05, 0x2B, 0x7A, 0x65, 0x00 };
+
+// Site 7 (0x0A18A3) is the one place where the read is narrow as well as the write:
+//     mov eax, dword ptr [r8+0x10]      <- reads half of a pointer the same function stores
+//     mov dword ptr [rip+0x657a83], eax    whole at 0x0A18FA, then publishes half of it
+// Two instructions have to grow, so this one needs a trampoline. rbx is free here: it is loaded
+// from [r8] by the very next instruction, which is where the trampoline returns to.
+#define SITE7_RVA 0x0A18A3
+static const unsigned char kSite7Expect[] = {
+	0x41, 0x8B, 0x40, 0x10,                            // mov eax, [r8+0x10]
+	0x89, 0x05, 0x83, 0x7A, 0x65, 0x00                 // mov [rip+0x657A83], eax
+};
+
+static const char* PatchListPointerWidth(unsigned char* cs)
+{
+	if (!g_cave)
+	{
+		g_cave = AllocCaveNear(cs);
+		if (!g_cave) return "no space for trampolines";
+	}
+	g_siteHits = (unsigned long long*)(g_cave + CAVE_COUNTERS_OFF);
+
+	unsigned char* at3 = cs + SITE3_RVA;
+	unsigned char* at7 = cs + SITE7_RVA;
+	unsigned char* at4 = cs + SITE4_RVA;
+	unsigned char* at5 = cs + SITE5_RVA;
+	if (at3[0] == 0xE9 && at4[0] == 0xE9 && at5[0] == 0xE9) return "list walk already";
+	if (memcmp(at7, kSite7Expect, sizeof(kSite7Expect)) != 0 ||
+	    memcmp(at3, kSite3Expect, sizeof(kSite3Expect)) != 0 ||
+	    memcmp(at4, kSite4Expect, sizeof(kSite4Expect)) != 0 ||
+	    memcmp(at5, kSite5Expect, sizeof(kSite5Expect)) != 0)
+		return "list walk no match";
+
+	// --- site 3: read and store the next pointer at full width ---
+	unsigned char* body3 = g_cave + g_caveUsed;
+	{
+		unsigned char code[32];
+		size_t n = 0;
+		n += EmitHitCounter(code, body3, &g_siteHits[0]);
+		code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x06;              // mov rax, [rsi]
+		code[n++] = 0x49; code[n++] = 0x89; code[n++] = 0x84; code[n++] = 0xED;
+		code[n++] = 0xA0; code[n++] = 0x91; code[n++] = 0x6F; code[n++] = 0x00;  // mov [r13+rbp*8+..], rax
+		if (!WriteBytes(body3, code, (unsigned long)n)) return "list walk write failed";
+		g_caveUsed += n;
+		// jump back to the instruction after the ten bytes being replaced
+		if (!WriteJump(g_cave + g_caveUsed, at3 + sizeof(kSite3Expect), 5)) return "list walk far";
+		g_caveUsed += 5;
+	}
+
+	// --- site 4: publish the arena pointer at full width, via r11 ---
+	unsigned char* body4 = g_cave + g_caveUsed;
+	{
+		const ULONGLONG target = (ULONGLONG)(cs + GLOBAL_ARENA_RVA);
+		unsigned char code[32];
+		size_t n = 0;
+		n += EmitHitCounter(code, body4, &g_siteHits[1]);
+		code[n++] = 0x49; code[n++] = 0xBB;                                 // mov r11, imm64
+		memcpy(code + n, &target, 8); n += 8;
+		code[n++] = 0x49; code[n++] = 0x89; code[n++] = 0x0B;               // mov [r11], rcx
+		if (!WriteBytes(body4, code, (unsigned long)n)) return "arena write failed";
+		g_caveUsed += n;
+		if (!WriteJump(g_cave + g_caveUsed, at4 + sizeof(kSite4Expect), 5)) return "arena far";
+		g_caveUsed += 5;
+	}
+
+	// --- site 5: publish the arena base at full width, via r10 ---
+	unsigned char* body5 = g_cave + g_caveUsed;
+	{
+		const ULONGLONG target = (ULONGLONG)(cs + GLOBAL_BASE_RVA);
+		unsigned char code[32];
+		size_t n = 0;
+		n += EmitHitCounter(code, body5, &g_siteHits[2]);
+		code[n++] = 0x49; code[n++] = 0xBA;                                 // mov r10, imm64
+		memcpy(code + n, &target, 8); n += 8;
+		code[n++] = 0x49; code[n++] = 0x89; code[n++] = 0x2A;               // mov [r10], rbp
+		if (!WriteBytes(body5, code, (unsigned long)n)) return "base write failed";
+		g_caveUsed += n;
+		if (!WriteJump(g_cave + g_caveUsed, at5 + sizeof(kSite5Expect), 5)) return "base far";
+		g_caveUsed += 5;
+	}
+
+	// --- site 7: read the block pointer and publish the cursor, both at full width ---
+	unsigned char* body7 = g_cave + g_caveUsed;
+	{
+		const ULONGLONG target = (ULONGLONG)(cs + GLOBAL_ARENA_RVA);
+		unsigned char code[48];
+		size_t n = 0;
+		n += EmitHitCounter(code, body7, &g_siteHits[3]);
+		code[n++] = 0x49; code[n++] = 0x8B; code[n++] = 0x40; code[n++] = 0x10;  // mov rax,[r8+0x10]
+		code[n++] = 0x48; code[n++] = 0xBB;                                       // mov rbx, imm64
+		memcpy(code + n, &target, 8); n += 8;
+		code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x03;                     // mov [rbx], rax
+		if (!WriteBytes(body7, code, (unsigned long)n)) return "cursor write failed";
+		g_caveUsed += n;
+		if (!WriteJump(g_cave + g_caveUsed, at7 + sizeof(kSite7Expect), 5)) return "cursor far";
+		g_caveUsed += 5;
+	}
+
+	if (FIX_SITE(3) && !WriteJump(at3, body3, sizeof(kSite3Expect))) return "list walk jump failed";
+	if (FIX_SITE(5) && !WriteJump(at5, body5, sizeof(kSite5Expect))) return "base jump failed";
+	if (FIX_SITE(7) && !WriteJump(at7, body7, sizeof(kSite7Expect))) return "cursor jump failed";
+
+	{
+		// Dump what was actually written. A trampoline that assembles wrongly looks exactly like
+		// one that was never applied, and the engine dies too early to leave a crash log.
+		FILE* f = fopen("launcher_trampoline.txt", "w");
+		if (f)
+		{
+			int i;
+			fprintf(f, "module     : %p\n", (void*)cs);
+			fprintf(f, "cave       : %p (used %u)\n", (void*)g_cave, (unsigned)g_caveUsed);
+			fprintf(f, "site3 at   : %p ->", (void*)at3);
+			for (i = 0; i < 10; i++) fprintf(f, " %02X", at3[i]);
+			fprintf(f, "\ncave body3 : %p ->", (void*)body3);
+			for (i = 0; i < 16; i++) fprintf(f, " %02X", body3[i]);
+			fprintf(f, "\nsite4 at   : %p ->", (void*)at4);
+			for (i = 0; i < 6; i++) fprintf(f, " %02X", at4[i]);
+			fprintf(f, "\ncave body4 : %p ->", (void*)body4);
+			for (i = 0; i < 18; i++) fprintf(f, " %02X", body4[i]);
+			fprintf(f, "\nreturn3 to : %p\nreturn4 to : %p\n",
+			        (void*)(at3 + sizeof(kSite3Expect)), (void*)(at4 + sizeof(kSite4Expect)));
+			fclose(f);
+		}
+	}
+	if (FIX_SITE(4) && !WriteJump(at4, body4, sizeof(kSite4Expect))) return "arena jump failed";
+	static char tramp[96];
+	sprintf(tramp, "trampolines walk %s arena %s base %s cursor %s",
+	        FIX_SITE(3) ? "on" : "off", FIX_SITE(4) ? "on" : "off",
+	        FIX_SITE(5) ? "on" : "off", FIX_SITE(7) ? "on" : "off");
+	return tramp;
+}
+
+// Site 2: the array of free-list heads is read 64 bits wide and written 32 bits wide.
+//
+//     mov rax, qword ptr [r8+r9*8+0x6F91A0]     <- read, REX.W set      (4B 8B ...)
+//     mov dword ptr [r8+r9*8+0x6F91A0], r10d    <- write, REX.W clear   (47 89 ...)
+//
+// The index scales by 8, so the elements are pointers, and the store drops the top half of
+// every one of them. Caught in the act: with the heap forced high this faults at 0x0A1720 in
+// the same function, with the full pointer in rdx (0x100470AA8) and its truncated self in rax
+// (0x470A90).
+//
+// Setting REX.W turns 47 into 4F and makes the store write the whole register. The instruction
+// keeps its length, so nothing around it moves - this is the cheapest correction of the three.
+#define SITE2_RVA 0x0A175D
+static const unsigned char kSite2Expect[]  = { 0x47, 0x89, 0x94, 0xC8, 0xA0, 0x91, 0x6F, 0x00 };
+static const unsigned char kSite2Patched[] = { 0x4F, 0x89, 0x94, 0xC8, 0xA0, 0x91, 0x6F, 0x00 };
+
+
+// Sets REX.W on an instruction that already has room for it, leaving everything else alone.
+static const char* WidenInPlace(unsigned char* at, const unsigned char* expect,
+                                const unsigned char* patched, size_t len)
+{
+	if (memcmp(at, patched, len) == 0) return "already";
+	if (memcmp(at, expect,  len) != 0) return "no match";
+	return WriteBytes(at, patched, (unsigned long)len) ? "applied" : "failed";
+}
+
 static const char* PatchSlabPointerWidth(void)
 {
 	HMODULE cs = GetModuleHandleA("CrySystem.dll");
 	if (!cs) return "CrySystem not loaded";
 
-	unsigned char* at = (unsigned char*)cs + SITE1_RVA;
-	if (memcmp(at, kSite1Patched, sizeof(kSite1Patched)) == 0) return "already applied";
-	if (memcmp(at, kSite1Expect, sizeof(kSite1Expect)) != 0) return "did not match this engine build";
-	return WriteBytes(at, kSite1Patched, sizeof(kSite1Patched)) ? "applied" : "write failed";
+	static char result[192];
+	unsigned char* base = (unsigned char*)cs;
+
+	const char* one   = FIX_SITE(1) ? WidenInPlace(base + SITE1_RVA, kSite1Expect, kSite1Patched, sizeof(kSite1Expect)) : "off";
+	const char* two   = FIX_SITE(2) ? WidenInPlace(base + SITE2_RVA, kSite2Expect, kSite2Patched, sizeof(kSite2Expect)) : "off";
+	const char* six   = FIX_SITE(6) ? WidenInPlace(base + SITE6_RVA, kSite6Expect, kSite6Patched, sizeof(kSite6Expect)) : "off";
+	const char* eight = FIX_SITE(8) ? WidenInPlace(base + SITE8_RVA, kSite8Expect, kSite8Patched, sizeof(kSite8Expect)) : "off";
+
+	sprintf(result, "slab %s, free-list %s, free-list#2 %s, cursor %s, %s",
+	        one, two, six, eight, PatchListPointerWidth(base));
+	return result;
 }
 
 // Reserves every free region below the 4 GB line, which forces the engine's heap above it.
@@ -638,9 +1267,107 @@ static const char* PatchSlabPointerWidth(void)
 // This makes the failure above reproducible on demand instead of waiting for a machine whose
 // address space happens to be laid out badly. Without the patch this reliably reproduces the
 // startup box; with it, startup should be unaffected. Diagnostic use only: -forcehighheap.
-static size_t ReserveLowAddressSpace(void)
+// Counters for the reservation below, reported in the diagnostic file.
+//
+// They exist because the first version of this silently reserved 4 MB out of 4 GB and reported
+// success, which made every measurement taken with -forcehighheap meaningless: the heap stayed
+// exactly where it always was. A flag that quietly does nothing is worse than no flag.
+static unsigned g_lowRegions = 0;      // free regions seen below the line
+static unsigned g_lowTaken   = 0;      // reservations that succeeded
+static unsigned g_lowFailed  = 0;      // reservations that failed
+static unsigned g_lowLastErr = 0;      // GetLastError of the last failure
+static size_t   g_lowLeft    = 0;      // small blocks left free on purpose
+
+// Pushes the engine's own large allocations above the 4 GB line.
+//
+// This replaces -forcehighheap as the way to test the pointer corrections. Reserving all the low
+// address space does move the heap up, but it also takes that space away from the renderer,
+// which maps its resources there - the game then stops during "Init textures management" whether
+// the pointers are corrected or not, so it measures nothing.
+//
+// Here only CrySystem's own VirtualAlloc calls are intercepted, and only the large ones: the
+// allocator's slab lands above the line while everything else, the renderer included, keeps
+// getting memory where it always did. If the engine runs with its slab up there, the truncation
+// really is gone rather than merely dormant.
+typedef LPVOID (WINAPI *VirtualAllocFn)(LPVOID, SIZE_T, DWORD, DWORD);
+static VirtualAllocFn g_realVirtualAlloc = 0;
+
+static LPVOID WINAPI HighVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
+{
+	if (!addr && g_highThreshold && size >= g_highThreshold && (type & MEM_RESERVE))
+	{
+		for (ULONGLONG base = 0x200000000ULL; base < 0x1000000000ULL; base += 0x10000000ULL)
+		{
+			LPVOID p = g_realVirtualAlloc((LPVOID)base, size, type, prot);
+			if (p)
+			{
+				g_highTaken++;
+				return p;
+			}
+		}
+		g_highMissed++;
+	}
+	return g_realVirtualAlloc(addr, size, type, prot);
+}
+
+// Redirects one imported function of a loaded module to a replacement, returning the original.
+static bool HookImport(HMODULE mod, const char* dll, const char* func, void* repl, void** orig)
+{
+	unsigned char* base = (unsigned char*)mod;
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+	const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+	const IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (!dir->VirtualAddress) return false;
+
+	const IMAGE_IMPORT_DESCRIPTOR* imp = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dir->VirtualAddress);
+	for (; imp->Name; imp++)
+	{
+		const char* name = (const char*)(base + imp->Name);
+		if (_stricmp(name, dll) != 0) continue;
+
+		// OriginalFirstThunk keeps the names, FirstThunk the addresses the code actually calls.
+		const IMAGE_THUNK_DATA64* names =
+			(const IMAGE_THUNK_DATA64*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk
+			                                                            : imp->FirstThunk));
+		IMAGE_THUNK_DATA64* addrs = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
+
+		for (; names->u1.AddressOfData; names++, addrs++)
+		{
+			if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+			const IMAGE_IMPORT_BY_NAME* byName =
+				(const IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
+			if (strcmp((const char*)byName->Name, func) != 0) continue;
+
+			DWORD old = 0;
+			if (!VirtualProtect(&addrs->u1.Function, sizeof(ULONGLONG), PAGE_READWRITE, &old))
+				return false;
+			if (orig) *orig = (void*)(ULONG_PTR)addrs->u1.Function;
+			addrs->u1.Function = (ULONGLONG)(ULONG_PTR)repl;
+			VirtualProtect(&addrs->u1.Function, sizeof(ULONGLONG), old, &old);
+			return true;
+		}
+	}
+	return false;
+}
+
+
+// Takes the large free blocks below the 4 GB line and leaves the small ones alone.
+//
+// Taking everything does not work: the engine then cannot start at all - it dies in five
+// seconds without reaching the level, with or without the pointer corrections, because loading
+// libraries and creating render buffers needs low memory too. That measures starvation, not
+// truncation.
+//
+// Leaving the small holes free keeps startup working while denying the allocator a large
+// contiguous block down there, so its slab has to go above the line - which is the condition
+// worth testing. keepBelow is the size in bytes under which a free block is left alone.
+static size_t ReserveLowAddressSpace(size_t keepBelow)
 {
 	const ULONG_PTR limit = (ULONG_PTR)0x100000000;
+	const SIZE_T    gran  = 0x10000;          // allocation granularity: VirtualAlloc rounds to it
 	size_t reserved = 0;
 	ULONG_PTR a = 0x10000;
 	MEMORY_BASIC_INFORMATION mbi;
@@ -650,11 +1377,50 @@ static size_t ReserveLowAddressSpace(void)
 		ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
 		if (mbi.State == MEM_FREE)
 		{
-			SIZE_T sz = mbi.RegionSize;
-			if ((ULONG_PTR)mbi.BaseAddress + sz > limit)
-				sz = (SIZE_T)(limit - (ULONG_PTR)mbi.BaseAddress);
-			if (VirtualAlloc(mbi.BaseAddress, sz, MEM_RESERVE, PAGE_NOACCESS))
-				reserved += sz;
+			g_lowRegions++;
+
+			// A free region does not have to start on a 64 KB boundary - the piece before the
+			// next boundary cannot be reserved at all, so skip forward to it.
+			ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
+			ULONG_PTR aligned = (base + gran - 1) & ~(ULONG_PTR)(gran - 1);
+			SIZE_T sz = (next > aligned) ? (SIZE_T)(next - aligned) : 0;
+			if (aligned + sz > limit)
+				sz = (aligned < limit) ? (SIZE_T)(limit - aligned) : 0;
+			sz &= ~(SIZE_T)(gran - 1);        // whole granules only
+
+			// Leave the first keepBelow bytes of free space alone, take everything after it.
+			// Filtering by block size does not work here: what is free below the line is a
+			// handful of large blocks and about 4 MB of scraps, so a size threshold either
+			// takes all of it or none.
+			if (sz)
+			{
+				if (g_lowLeft < keepBelow)
+				{
+					const SIZE_T spare = (SIZE_T)(keepBelow - g_lowLeft);
+					const SIZE_T leave = (sz <= spare) ? sz : spare;
+					g_lowLeft += leave;
+					aligned += leave;
+					sz -= leave;
+				}
+			}
+
+			if (sz)
+			{
+				LPVOID got = VirtualAlloc((LPVOID)aligned, sz, MEM_RESERVE, PAGE_NOACCESS);
+				if (got)
+				{
+					reserved += sz;
+					g_lowTaken++;
+					if (g_lowBlockCount < MAX_LOW_BLOCKS)
+						g_lowBlocks[g_lowBlockCount++] = got;
+					g_lowHeld = true;
+				}
+				else
+				{
+					g_lowFailed++;
+					g_lowLastErr = GetLastError();
+				}
+			}
 		}
 		if (next <= a) break;
 		a = next;
@@ -662,8 +1428,28 @@ static size_t ReserveLowAddressSpace(void)
 	return reserved;
 }
 
+static const char* InstallHighSlab(SIZE_T thresholdBytes)
+{
+	// Two things together: the proxy, so the first large allocation can be recognised, and the
+	// reservation, so that allocation has nowhere low to go. The reservation is released inside
+	// the proxy as soon as that allocation returns, which is what keeps the renderer working.
+	const char* proxy = InstallArenaProxy();
+	if (strcmp(proxy, "installed") != 0 && strcmp(proxy, "already installed") != 0)
+		return proxy;
+
+	g_highThreshold = thresholdBytes;
+	const size_t held = ReserveLowAddressSpace(0);
+	if (!held) return "nothing could be reserved";
+
+	static char msg[64];
+	sprintf(msg, "holding %u MB until the arena is taken, via CrySystemCrtMalloc",
+	        (unsigned)(held / (1024 * 1024)));
+	return msg;
+}
+
 static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderless,
-                            const char* slabFix, size_t lowReserved, const char* allocTrace)
+                            const char* slabFix, size_t lowReserved, const char* allocTrace,
+                            const char* highSlab)
 {
 	FILE* f = fopen("launcher_diag.txt", "w");
 	if (!f) return;
@@ -674,6 +1460,7 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	DiagLine(f, "timer 1ms      : %s", timerRaised ? "raised OK" : "FAILED (expect ~64 fps cap)");
 	DiagLine(f, "borderless     : %s", borderless ? "enabled" : "disabled (-noborderless)");
 	DiagLine(f, "engine fix     : %s", slabFix);
+	DiagLine(f, "fix mask       : 0x%02X (sites 1-8, bit per site)", g_fixMask);
 	DiagLine(f, "alloc trace    : %s", allocTrace);
 	{
 		size_t totalFree = 0;
@@ -681,9 +1468,17 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 		DiagLine(f, "low address sp : %u MB free, largest single block %u MB",
 		         (unsigned)(totalFree / (1024 * 1024)), (unsigned)(largest / (1024 * 1024)));
 	}
-	if (lowReserved)
-		DiagLine(f, "low space      : %u MB reserved (-forcehighheap, diagnostic)",
-		         (unsigned)(lowReserved / (1024 * 1024)));
+	DiagLine(f, "high arena     : %s", g_highArenaMsg);
+	DiagLine(f, "high slab      : %s (%u moved above 4 GB, %u could not be)",
+	         highSlab, g_highTaken, g_highMissed);
+	if (lowReserved || g_lowRegions)
+	{
+		DiagLine(f, "low space      : %u MB reserved, %u MB left free in small blocks "
+		            "(%u regions: %u taken, %u refused, last error %u)",
+		         (unsigned)(lowReserved / (1024 * 1024)),
+		         (unsigned)(g_lowLeft / (1024 * 1024)),
+		         g_lowRegions, g_lowTaken, g_lowFailed, g_lowLastErr);
+	}
 	DiagLine(f, "");
 
 	// Install path, write access, locale and free space: environment differences that hardware
@@ -875,6 +1670,65 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	fclose(f);
 }
 
+// Reports where the allocator's own pointers actually are, and whether the corrected
+// instructions are reached at all. Enabled with -sitewatch.
+//
+// The question it answers: with -highslab the arena came back from above the 4 GB line, and yet
+// the game behaved identically with and without -enginefix. Either the corrected code never
+// runs, or the allocator state being watched is not the state that moved. The counters settle
+// the first, the globals settle the second.
+//
+// The array of free-list heads runs from 0x6F91A0 up to the globals at 0x6F9330, so 32 entries
+// is well inside it.
+static DWORD WINAPI SiteWatchThread(LPVOID)
+{
+	unsigned char* cs = (unsigned char*)GetModuleHandleA("CrySystem.dll");
+	if (!cs) return 0;
+
+	char line[512];
+	int n = sprintf(line, "--- sitewatch: CrySystem at %p, counters %s ---\n",
+	                (void*)cs, g_siteHits ? "armed" : "unavailable (no -enginefix)");
+	AppendTextFile("launcher_sites.txt", line, (unsigned long)n);
+
+	unsigned long long prev[7];
+	memset(prev, 0xFF, sizeof(prev));
+
+	for (unsigned tick = 0; ; tick++)
+	{
+		unsigned long long cur[7];
+		cur[0] = *(unsigned long long*)(cs + 0x6F9338);
+		cur[1] = *(unsigned long long*)(cs + GLOBAL_ARENA_RVA);
+		cur[2] = *(unsigned long long*)(cs + GLOBAL_BASE_RVA);
+		cur[3] = g_siteHits ? g_siteHits[0] : 0;
+		cur[4] = g_siteHits ? g_siteHits[1] : 0;
+		cur[5] = g_siteHits ? g_siteHits[2] : 0;
+		cur[6] = g_siteHits ? g_siteHits[3] : 0;
+
+		const unsigned long long* heads = (const unsigned long long*)(cs + 0x6F91A0);
+		unsigned used = 0, above = 0;
+		for (unsigned i = 0; i < 32; i++)
+		{
+			const unsigned long long h = heads[i];
+			if (!h) continue;
+			used++;
+			if (h >= 0x100000000ull) above++;
+		}
+
+		if (memcmp(cur, prev, sizeof(cur)) != 0)
+		{
+			memcpy(prev, cur, sizeof(cur));
+			n = sprintf(line,
+			            "[%4us] slab=0x%llX arena=0x%llX base=0x%llX"
+			            "  hits: walk=%llu arena=%llu base=%llu cursor=%llu"
+			            "  heads: %u used, %u above 4 GB\n",
+			            tick * 2, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6],
+			            used, above);
+			AppendTextFile("launcher_sites.txt", line, (unsigned long)n);
+		}
+		Sleep(2000);
+	}
+}
+
 // Writes the cutscene-skip counters to movie_skips.txt while the game runs, enabled with
 // -moviestats.
 //
@@ -1002,6 +1856,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// process is built against msvcr90, whose heap stays low. Verified by forcing the heap up
 	// with -forcehighheap, which startup survives either way. So the engine is left alone
 	// unless asked: -enginefix applies the correction.
+	{
+		const char* arg = lpCmdLine ? strstr(lpCmdLine, "-enginefix") : 0;
+		if (arg && (arg[10] == ':' || arg[10] == '='))
+		{
+			unsigned v = 0;
+			if (sscanf(arg + 11, "%x", &v) == 1 && v) g_fixMask = v;
+		}
+	}
 	const char* slabFix = (lpCmdLine && strstr(lpCmdLine, "-enginefix"))
 	                    ? PatchSlabPointerWidth()
 	                    : "off (engine untouched)";
@@ -1011,9 +1873,55 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	                       ? InstallAllocProxy() : "off";
 
 	// Diagnostic: force the heap above the 4 GB line to reproduce the failure on demand.
+	// -highslab[:N] - make the bucket allocator build its arena above the 4 GB line, which is
+	// the one honest test of the pointer corrections: only the allocator's own memory moves
+	// up, so the renderer is unaffected.
+	//
+	// With no number it waits for an allocation of exactly the arena size and squeezes that
+	// one. N (in KB) turns it back into a threshold, which catches unrelated blocks too.
+	const char* highSlab = "off";
+	{
+		const char* arg = lpCmdLine ? strstr(lpCmdLine, "-highslab") : 0;
+		if (arg)
+		{
+			// The arena is 0x80000 bytes and nothing else that size goes through this
+			// door, so an exact match is a far better filter than any threshold.
+			size_t kb = BUCKET_ARENA_BYTES / 1024;
+			const char* sep = arg + 9;
+			if (*sep == ':' || *sep == '=')
+			{
+				const int v = atoi(sep + 1);
+				if (v > 0 && v < 65536) { kb = (size_t)v; g_arenaExact = false; }
+			}
+			highSlab = InstallHighSlab((SIZE_T)kb * 1024);
+		}
+	}
+
+	// -arenahigh - every arena the bucket allocator builds is served from above the 4 GB
+	// line, for as long as the game runs. This is the test -highslab could not be: it holds
+	// the condition for the whole session instead of a single allocation, and it takes no low
+	// memory away from the renderer.
+	if (lpCmdLine && strstr(lpCmdLine, "-arenahigh"))
+		g_highArenaMsg = InstallHighArena();
+
+	// -forcehighheap[:N] - N is how many MB of low address space to leave free. Everything
+	// above that is reserved, so large allocations have to go above the 4 GB line while the
+	// engine still has room to load libraries and build its render buffers.
 	size_t lowReserved = 0;
-	if (lpCmdLine && strstr(lpCmdLine, "-forcehighheap"))
-		lowReserved = ReserveLowAddressSpace();
+	{
+		const char* arg = lpCmdLine ? strstr(lpCmdLine, "-forcehighheap") : 0;
+		if (arg)
+		{
+			size_t keepMB = 512;
+			const char* colon = arg + 14;
+			if (*colon == ':' || *colon == '=')
+			{
+				const int v = atoi(colon + 1);
+				if (v > 0 && v < 4096) keepMB = (size_t)v;
+			}
+			lowReserved = ReserveLowAddressSpace(keepMB * 1024 * 1024);
+		}
+	}
 
 	SetCwdToGameRoot();
 
@@ -1022,6 +1930,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, MovieStatsThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
+
+	// Diagnostic: follow the allocator globals and the trampoline counters while the game runs.
+	if (lpCmdLine && strstr(lpCmdLine, "-sitewatch"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, SiteWatchThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
 
@@ -1085,7 +2001,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// Write the report before engine init, so the file survives a crash during startup and the
 	// tester still has something to send.
 #ifndef NO_DIAG
-	WriteDiagReport(lpCmdLine, timerRaised, wantBorderless, slabFix, lowReserved, allocTrace);
+	WriteDiagReport(lpCmdLine, timerRaised, wantBorderless, slabFix, lowReserved, allocTrace,
+	                highSlab);
 #endif
 
 	// Bring up the engine's memory system first, in the same order the editor does.

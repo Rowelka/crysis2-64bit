@@ -38,6 +38,21 @@ no working backend regardless of what the launcher does.
 Worth doing anyway: not crashing. A crash tells the player nothing; a message saying the service
 is gone tells them everything. Needs the crash located first.
 
+### Resolution reads "undefined" in the 64-bit client
+
+Reported by ErBuSlayer, who tested the same thing on a second machine and with the older
+c2-launcher to separate it from this one. In the 64-bit client the graphics menu shows the
+resolution as `undefined` and the game does not pick a mode by itself; with DX11 on, the older
+launcher gives a small mis-sized window. The 32-bit client sets the resolution automatically and
+does not. DXVK on 64-bit fixes it, which points at the D3D path rather than at the menu.
+
+So this is a 64-bit renderer issue Crytek left behind, not something the launcher introduced:
+our build does go fullscreen, but the menu still reads `undefined`. Worth pairing with the
+refresh-rate item above, since both end in the same place - taking over mode selection instead
+of leaving it to the renderer. c1-launcher has a patch for the sibling bug in Crysis 1
+(ccomrade/c1-launcher, commit f205939, "fixes the low refresh rate bug in DX10 mode") and is
+worth reading before writing our own.
+
 ## Open from our own testing
 
 ### Weapon effects stop appearing
