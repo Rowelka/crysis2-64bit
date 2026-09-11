@@ -1,14 +1,19 @@
-// Crysis cursor resources.
+// Resources taken from the game's own executable.
 //
-// The game loads its cursor with LoadCursorA against the running executable, which with this
-// project is the launcher rather than Crysis2.exe. Without these resources LoadCursorA returns
-// NULL and the cursor is invisible: the mouse still works and menu buttons still highlight,
-// but nothing is drawn under the pointer.
+// The icon comes first on purpose: Windows shows the lowest-numbered icon as the application
+// icon, and the launcher should look like a way to start Crysis 2 rather than a stray tool.
 //
-// The ids must match the original (103-107) because those are what the game asks for.
-// The .cur files are Crytek assets and are not stored in this repository - extract_cursors.py
-// pulls them from the Crysis2.exe of the installed game at build time.
+// The cursors are here because the game loads its cursor with LoadCursorA against the running
+// executable, which with this project is the launcher rather than Crysis2.exe. Without these
+// resources LoadCursorA returns NULL and the cursor is invisible: the mouse still works and
+// menu buttons still highlight, but nothing is drawn under the pointer.
+//
+// The ids must match the original (101 for the icon, 103-107 for the cursors) because those
+// are what the game asks for. Both are Crytek assets and are not stored in this repository -
+// extract_resources.py pulls them from the Crysis2.exe of the installed game at build time.
 #include "resource.h"
+
+IDI_ICON                ICON    "res/icon_101.ico"
 
 IDC_CRYSISCURSOR_AMBER  CURSOR  "res/cursor_103.cur"
 IDC_CRYSISCURSOR_BLUE   CURSOR  "res/cursor_104.cur"

@@ -81,6 +81,23 @@ static unsigned long long  g_movieRetSkip = 0;
 static unsigned long long  g_movieOldBegin = 0;
 // Module base of CryMovie.dll, used by the handler above to locate its patched ranges.
 static unsigned long long  g_cryMovieBase = 0;
+// How often each of the workarounds below had to fire, indexed A..G in their own order.
+//
+// These are not a curiosity. Every hit is an element of a cutscene that was skipped, so a
+// non-zero count means the scene on screen is missing something it was supposed to show - a
+// node, a track, a key. A sequence that plays correctly leaves all seven at zero. -moviestats
+// writes them to movie_skips.txt while the game runs.
+static volatile LONG g_movieSkips[7] = { 0, 0, 0, 0, 0, 0, 0 };
+static const char* const kMovieSkipNames[7] = {
+	"A element unmapped in the update loop",
+	"B virtual call from the update loop went astray",
+	"C track key accessor read past its array",
+	"D node hierarchy walk hit a reused object",
+	"E node hierarchy virtual call landed on data",
+	"F sequence node skipped (reused memory)",
+	"G track reported as empty (freed under precache)"
+};
+
 static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 {
 	if (ep && ep->ExceptionRecord && g_movieCave) {
@@ -89,6 +106,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 		unsigned long long rip = (unsigned long long)ep->ContextRecord->Rip;
 		// A: faulted inside the cave itself, dereferencing an element pointer that was unmapped.
 		if (rip >= caveLo && rip < caveHi) {
+			InterlockedIncrement(&g_movieSkips[0]);
 			ep->ContextRecord->Rip = g_movieRetSkip;   // skip this element, continue the loop
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
@@ -100,6 +118,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			unsigned long long ret = *(unsigned long long*)rsp;
 			if (ret >= caveLo && ret < caveHi) {
 				ep->ContextRecord->Rsp = rsp + 8;         // drop the failed call's return address
+				InterlockedIncrement(&g_movieSkips[1]);
 				ep->ContextRecord->Rip = g_movieRetSkip;  // skip this element
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
@@ -111,6 +130,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			unsigned long long accHi = g_cryMovieBase + 0x2B604;
 			if (rip >= accLo && rip < accHi) {
 				ep->ContextRecord->Xmm0.Low = 0; ep->ContextRecord->Xmm0.High = 0;  // return 0.0f
+				InterlockedIncrement(&g_movieSkips[2]);
 				ep->ContextRecord->Rip = g_cryMovieBase + 0x2B604;                    // ret
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
@@ -120,6 +140,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 			unsigned long long h_lo = g_cryMovieBase + 0x3A630;
 			unsigned long long h_hi = g_cryMovieBase + 0x3A69B;
 			if (rip >= h_lo && rip < h_hi) {
+				InterlockedIncrement(&g_movieSkips[3]);
 				ep->ContextRecord->Rip = g_cryMovieBase + 0x3A67A;   // xor eax,eax; add rsp,0x20; pop rbx; ret
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
@@ -131,6 +152,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 				unsigned long long ret = *(unsigned long long*)rsp;
 				if (ret >= h_lo && ret < h_hi) {
 					ep->ContextRecord->Rsp = rsp + 8;                    // drop the failed call's return
+					InterlockedIncrement(&g_movieSkips[4]);
 					ep->ContextRecord->Rip = g_cryMovieBase + 0x3A67A;   // leave as "not found"
 					return EXCEPTION_CONTINUE_EXECUTION;
 				}
@@ -142,6 +164,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 				unsigned long long fl = g_cryMovieBase + 0x2104;
 				unsigned long long fh = g_cryMovieBase + 0x2148;
 				if (rip >= fl && rip < fh) {                              // faulted inside the loop body
+					InterlockedIncrement(&g_movieSkips[5]);
 					ep->ContextRecord->Rip = g_cryMovieBase + 0x213E;    // skip this node, keep iterating
 					return EXCEPTION_CONTINUE_EXECUTION;
 				} else {                                                 // the call jumped to data
@@ -149,6 +172,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 					unsigned long long ret = *(unsigned long long*)rsp;
 					if (ret >= fl && ret < fh) {
 						ep->ContextRecord->Rsp = rsp + 8;                // drop the failed call's return
+						InterlockedIncrement(&g_movieSkips[5]);
 						ep->ContextRecord->Rip = g_cryMovieBase + 0x213E; // skip this node
 						return EXCEPTION_CONTINUE_EXECUTION;
 					}
@@ -162,6 +186,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 				unsigned long long gh = g_cryMovieBase + 0x5AE5C;
 				if (rip >= gl && rip < gh) {                              // faulted reading the track
 					ep->ContextRecord->Rax = 0;                          // report zero keys
+					InterlockedIncrement(&g_movieSkips[6]);
 					ep->ContextRecord->Rip = g_cryMovieBase + 0x5AE5C;   // → je 0x5bacf → inc r14 → next track
 					return EXCEPTION_CONTINUE_EXECUTION;
 				} else {                                                 // the call jumped to data
@@ -170,6 +195,7 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 					if (ret >= gl && ret < gh) {
 						ep->ContextRecord->Rsp = rsp + 8;                // drop the failed call's return
 						ep->ContextRecord->Rax = 0;
+						InterlockedIncrement(&g_movieSkips[6]);
 						ep->ContextRecord->Rip = g_cryMovieBase + 0x5AE5C;
 						return EXCEPTION_CONTINUE_EXECUTION;
 					}
@@ -849,6 +875,47 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	fclose(f);
 }
 
+// Writes the cutscene-skip counters to movie_skips.txt while the game runs, enabled with
+// -moviestats.
+//
+// A thread rather than a write on the way out: the interesting scene may be twenty minutes
+// into a level, and the game can be closed in ways that never reach the end of WinMain. The
+// file is rewritten only when a number actually changes, so watching a clean cutscene costs
+// nothing.
+static DWORD WINAPI MovieStatsThread(LPVOID)
+{
+	LONG last[7];
+	int i;
+	for (i = 0; i < 7; i++) last[i] = -1;
+
+	for (;;)
+	{
+		Sleep(3000);
+
+		bool changed = false;
+		for (i = 0; i < 7; i++)
+			if (g_movieSkips[i] != last[i]) changed = true;
+		if (!changed) continue;
+
+		FILE* f = fopen("movie_skips.txt", "w");
+		if (!f) continue;
+
+		fprintf(f, "Cutscene elements the launcher's workarounds had to skip.\n");
+		fprintf(f, "All zero means no cutscene lost anything. Any other number means a node,\n");
+		fprintf(f, "a track or a key was dropped, and the scene is missing part of itself.\n\n");
+
+		LONG total = 0;
+		for (i = 0; i < 7; i++)
+		{
+			last[i] = g_movieSkips[i];
+			total += last[i];
+			fprintf(f, "%9ld  %s\n", last[i], kMovieSkipNames[i]);
+		}
+		fprintf(f, "\n%9ld  total\n", total);
+		fclose(f);
+	}
+}
+
 // What a player sees when a piece of the 64-bit engine is not where it has to be.
 //
 // Left to Windows, a missing CrySystem.dll produces "the system cannot find CrySystem.dll, try
@@ -949,6 +1016,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		lowReserved = ReserveLowAddressSpace();
 
 	SetCwdToGameRoot();
+
+	// Diagnostic: report what the cutscene workarounds are dropping, if anything.
+	if (lpCmdLine && strstr(lpCmdLine, "-moviestats"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, MovieStatsThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
 
 #ifndef NO_DETECTOR
 	// Watch for pointers that lost their top half. Observes only; see TruncationVEH.

@@ -19,7 +19,7 @@
 !LICENSE
 !build.ps1
 !test.ps1
-!extract_cursors.py
+!extract_resources.py
 !launcher.rc
 !resource.h
 !Main_min.cpp

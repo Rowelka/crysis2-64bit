@@ -213,7 +213,7 @@ Both are set from the launcher's command line at startup:
 
 Pass `-keepintro` to restore the original behaviour, or set the CVars from the console.
 
-### 6. The invisible cursor
+### 6. The invisible cursor, and the missing icon
 
 The game loads its cursor with `LoadCursorA` against the running executable, which with this
 project is the launcher rather than `Crysis2.exe`. The original executable carries those cursor
@@ -222,9 +222,12 @@ disappears. The mouse still works: menu buttons highlight on hover, clicks land 
 but nothing is drawn under the pointer.
 
 The launcher links the same resources under the same ids the game asks for (103-107, the amber,
-blue, green, red and white Crysis cursors). Those are Crytek assets, so they are not stored here.
-`extract_cursors.py` pulls them out of the `Crysis2.exe` of the installed game at build time, and
-`build.ps1` runs it automatically.
+blue, green, red and white Crysis cursors), and the game's own icon under id 101 - without it
+Windows draws the blank default, and the launcher looks like a stray tool next to the game rather
+than a way to start it.
+
+Both are Crytek assets, so they are not stored here. `extract_resources.py` pulls them out of the
+`Crysis2.exe` of the installed game at build time, and `build.ps1` runs it automatically.
 
 ## How it works
 
@@ -276,7 +279,7 @@ You need:
   `launcher_diag.txt` - because `CrySystem` is imported statically and its static initialisers
   allocate through the engine allocator while the wrong CRT is the primary one.
 - **Windows 10 SDK** for `rc.exe` and `mt.exe`, the resource compiler and manifest tool.
-- **An installed copy of the game**, because the build extracts cursor resources from its
+- **An installed copy of the game**, because the build extracts the cursors and the icon from its
   `Crysis2.exe`.
 
 Run it:
@@ -300,15 +303,15 @@ name the install yourself:
 | `-Kit` | Windows SDK `bin\<version>\x64`, if the newest installed one is not wanted |
 | `-NoDeploy` | build only, do not copy the result into the game |
 
-The script extracts the cursors, compiles the resource script, builds `Main_min.cpp`, embeds the
+The script extracts the cursors and the icon, compiles the resource script, builds `Main_min.cpp`, embeds the
 VC90 CRT manifest, and copies the result into the game's `Bin64`.
 
 Nothing links against the engine. `CreateSystemInterface` is resolved with `LoadLibrary` at
 startup, so no import library is generated and none is needed - and a missing or misplaced engine
 produces an explanation from the launcher rather than Windows' "reinstall the program" box.
 
-The cursor `.cur` files are absent from this repository on purpose and extracted from the
-installation at build time: they are Crytek assets, not ours to distribute.
+The cursor `.cur` files and the `.ico` are absent from this repository on purpose and extracted
+from the installation at build time: they are Crytek assets, not ours to distribute.
 
 ### Testing a build
 

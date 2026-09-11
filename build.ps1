@@ -80,14 +80,18 @@ if (Test-Path $out) { Remove-Item $out -Force }
 # launcher. Without them the in-game cursor is invisible (the mouse still works). The .cur
 # files are Crytek assets and are not stored here - they are extracted from the installation.
 $resFile = Join-Path $dir "launcher.res"
-if (-not (Test-Path (Join-Path $dir "res\cursor_103.cur"))) {
+$haveCursors = Test-Path (Join-Path $dir "res\cursor_103.cur")
+$haveIcon    = Test-Path (Join-Path $dir "res\icon_101.ico")
+if (-not ($haveCursors -and $haveIcon)) {
     if (Test-Path $game32) {
-        & python (Join-Path $dir "extract_cursors.py") $game32 (Join-Path $dir "res")
+        & python (Join-Path $dir "extract_resources.py") $game32 (Join-Path $dir "res")
+        $haveCursors = Test-Path (Join-Path $dir "res\cursor_103.cur")
+        $haveIcon    = Test-Path (Join-Path $dir "res\icon_101.ico")
     } else {
-        Write-Warning "bin32\Crysis2.exe not found - building without cursors (in-game cursor will be invisible)"
+        Write-Warning "bin32\Crysis2.exe not found - building without the game's cursors and icon"
     }
 }
-if ((Test-Path (Join-Path $dir "res\cursor_103.cur")) -and $rc -and (Test-Path $rc)) {
+if ($haveCursors -and $haveIcon -and $rc -and (Test-Path $rc)) {
     & $rc /nologo /fo $resFile (Join-Path $dir "launcher.rc")
 }
 
