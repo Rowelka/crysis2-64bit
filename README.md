@@ -92,7 +92,7 @@ call is per-process, so it affects only the game.
 
 **Result on an RTX 3060 @ 1920x1080:** a hard 64 FPS becomes **270-330 FPS**.
 
-> Note: this is listed as an open item in [c2-launcher](https://github.com/ItsNiklas/c2-launcher)'s
+> Note: this is listed as an open item in [c2-launcher](https://github.com/mvoolt/c2-launcher)'s
 > TODO (*"fix DX11 fps cap limit on fullscreen"*), where the working hypothesis was to force
 > borderless windowed. The real cause turned out to be unrelated to the window mode - the lock is
 > present in windowed mode too.
@@ -341,7 +341,7 @@ information.
 
 - **[c1-launcher](https://github.com/ccomrade/c1-launcher)** by *ccomrade* - the original
   open-source Crysis launcher, and the reference that showed this approach is viable.
-- **[c2-launcher](https://github.com/ItsNiklas/c2-launcher)** - the CryAction assert-patch
+- **[c2-launcher](https://github.com/mvoolt/c2-launcher)** - the CryAction assert-patch
   addresses used here were taken from that project.
 
 This launcher's source is written from scratch (STL-free, so it can be compiled by the VC90
