@@ -1807,6 +1807,484 @@ static void ReportMainThreadStack(const char* why)
 //
 // The array of free-list heads runs from 0x6F91A0 up to the globals at 0x6F9330, so 32 entries
 // is well inside it.
+// Makes the renderer's constant-buffer cache big enough for the sizes it is asked for.
+//
+// The cache is an array per shader stage and buffer type, indexed by the buffer's size in
+// vectors, and the sizes are set by a switch at RVA 0x05A93A: 512 entries for type 0, 128 for
+// types 1 and 2. Nothing checks that the requested size fits. The entry point at 0x036E10
+// verifies only that offset + count fits the buffer, so a shader asking for a 224-vector
+// buffer of type 1 reads entry 224 of a 128-entry array, takes whatever lies past its end for
+// an ID3D11Buffer, and hands it to Map - which faults inside d3d11.dll reading [rdx+0xC9].
+//
+// Raising every array to 1024 entries costs 8 KB each, 240 KB across the whole table, and puts
+// every size the engine can ask for inside the array. The instruction length does not change:
+// the immediate of "mov esi, imm32" is simply a larger number.
+#define CB_SIZE_T0_RVA 0x05A951      // mov esi, 0x200
+#define CB_SIZE_T1_RVA 0x05A94A      // mov esi, 0x80
+#define CB_SIZE_T2_RVA 0x05A958      // mov esi, 0x80
+#define CB_CACHE_ENTRIES 1024
+
+static const char* WidenOneCbArray(unsigned char* at, unsigned had)
+{
+	unsigned char want[5];
+	want[0] = 0xBE;
+	memcpy(want + 1, &had, 4);
+	const unsigned entries = CB_CACHE_ENTRIES;
+
+	unsigned char patched[5];
+	patched[0] = 0xBE;
+	memcpy(patched + 1, &entries, 4);
+
+	if (memcmp(at, patched, 5) == 0) return "already";
+	if (memcmp(at, want, 5) != 0) return "no match";
+	return WriteBytes(at, patched, 5) ? "applied" : "failed";
+}
+
+// Runs before the renderer builds the table, so it polls for the module rather than waiting on
+// a timer: the arrays are allocated during device creation, well after the DLL is mapped.
+static DWORD WINAPI CbFixThread(LPVOID)
+{
+	unsigned char* rd = 0;
+	for (int i = 0; i < 12000 && !rd; i++)
+	{
+		rd = (unsigned char*)GetModuleHandleA("CryRenderD3D11.dll");
+		if (!rd) Sleep(5);
+	}
+	if (!rd) return 0;
+
+	const char* a = WidenOneCbArray(rd + CB_SIZE_T0_RVA, 0x200);
+	const char* b = WidenOneCbArray(rd + CB_SIZE_T1_RVA, 0x80);
+	const char* c = WidenOneCbArray(rd + CB_SIZE_T2_RVA, 0x80);
+
+	char line[224];
+	int n = sprintf(line, "  cbfix: cache arrays -> %u entries (type0 %s, type1 %s, type2 %s)%s",
+	                (unsigned)CB_CACHE_ENTRIES, a, b, c, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+	return 0;
+}
+
+// Watches the renderer's constant-buffer table for corruption.
+//
+// The renderer keeps its D3D11 constant buffers in a 10 x 6 table of pointers to arrays of
+// ID3D11Buffer*, built at CryRenderD3D11 RVA 0x05A8F6 and read at 0x036EFF. A run that dies
+// in d3d11.dll!Map died because one entry of one of those arrays held 0x00A600A700A900A5 -
+// data, not a pointer. By then the writer is long gone, so the table is checked here while
+// the game runs: the first bad entry is reported with its neighbourhood, and what the
+// neighbourhood contains says whose data landed there.
+#define CB_TABLE_RVA 0x3433F0
+
+// Entries per array, by type. Read out of the instruction that sets them rather than written
+// down here: a hand-copied { 128, 512, 128 } (types 0 and 1 swapped, because the labels appear
+// in the code in a different order than the jump table assigns them) produced an evening of
+// false evidence. Reading 512 entries of a 128-entry array reports everything past its end as
+// "corruption", always at index 128, and makes neighbouring blocks look like they overlap.
+// Reading the number the code actually uses cannot be wrong, and it follows -cbfix for free.
+static unsigned CbCount(const unsigned char* rd, unsigned type)
+{
+	static const unsigned kRva[6] = { CB_SIZE_T0_RVA, CB_SIZE_T1_RVA, CB_SIZE_T2_RVA, 0, 0, 0 };
+	if (type >= 6 || !kRva[type]) return 0;
+	const unsigned char* at = rd + kRva[type];
+	if (at[0] != 0xBE) return 0;                  // not "mov esi, imm32" any more
+	unsigned n = 0;
+	memcpy(&n, at + 1, 4);
+	return (n <= 65536) ? n : 0;
+}
+
+// Cheap first: real user-space pointers live below the canonical limit, and the corruption
+// seen so far fails this test outright. VirtualQuery only confirms a suspicion.
+static bool LooksLikePointer(ULONG_PTR v)
+{
+	if (v == 0) return true;                              // an empty slot is fine
+	if (v < 0x10000) return false;
+	if (v >= 0x0000800000000000ull) return false;         // not a canonical user address
+	return true;
+}
+
+static void DumpAround(const unsigned char* at, int before, int after, char* buf, int* pn)
+{
+	int n = *pn;
+	for (int row = -before; row < after; row += 16)
+	{
+		const unsigned char* p = at + row;
+		ULONG_PTR probe = 0;
+		if (!SafePeek(p, &probe)) continue;
+		n += sprintf(buf + n, "    %+5d  %016llX:", row, (unsigned long long)(ULONG_PTR)p);
+		for (int i = 0; i < 16; i++) n += sprintf(buf + n, " %02X", p[i]);
+		n += sprintf(buf + n, "%s", "\n");
+	}
+	*pn = n;
+}
+
+// Thread enumeration, declared here: the minimal header set this launcher builds against has
+// no tlhelp32.h, and the three entry points are resolved at run time rather than linked.
+#define TH32CS_SNAPTHREAD_ 0x00000004
+struct THREADENTRY32_
+{
+	DWORD dwSize;
+	DWORD cntUsage;
+	DWORD th32ThreadID;
+	DWORD th32OwnerProcessID;
+	LONG  tpBasePri;
+	LONG  tpDeltaPri;
+	DWORD dwFlags;
+};
+typedef HANDLE (WINAPI *PFN_Snapshot)(DWORD, DWORD);
+typedef BOOL   (WINAPI *PFN_Thread32)(HANDLE, THREADENTRY32_*);
+
+// A hardware watchpoint on one address, so the writer names itself.
+//
+// Everything up to here reads the damage after the fact: a table entry holds data instead of a
+// pointer, and the address it sits at is an arena address with its top half cut off. That says
+// what happened but not who did it, and the search space is every module that touches an object
+// from the arena - including code that builds an address with 32-bit arithmetic, which no scan
+// of the instruction stream picks out reliably.
+//
+// The processor can answer directly. DR0 holds the address, DR7 arms it for writes, and the
+// next store to those eight bytes raises a single-step exception with RIP still pointing at the
+// instruction that did it. Debug registers are per-thread, so every thread in the process gets
+// the same setting, and threads created later are picked up by arming again.
+// Off unless -cbwatch is given. Arming touches every thread in the process, and doing that
+// on a timer hung the game solid: a thread suspended while it holds a lock stops everyone
+// waiting on that lock. It is armed once, and only when explicitly asked for.
+static bool  g_cbWatch = false;
+static void* g_watchAddr = 0;
+static volatile LONG g_watchHits = 0;
+
+static unsigned g_watchThreads = 0;    // threads that actually took the setting
+static unsigned g_watchSeen = 0;       // threads looked at
+
+static void ArmWriteWatch(void* addr, bool enable)
+{
+	HMODULE k32 = GetModuleHandleA("kernel32.dll");
+	PFN_Snapshot pSnap = (PFN_Snapshot)GetProcAddress(k32, "CreateToolhelp32Snapshot");
+	PFN_Thread32 pFirst = (PFN_Thread32)GetProcAddress(k32, "Thread32First");
+	PFN_Thread32 pNext  = (PFN_Thread32)GetProcAddress(k32, "Thread32Next");
+	if (!pSnap || !pFirst || !pNext) return;
+
+	const DWORD me = GetCurrentThreadId();
+	HANDLE snap = pSnap(TH32CS_SNAPTHREAD_, 0);
+	if (snap == INVALID_HANDLE_VALUE) return;
+
+	THREADENTRY32_ te;
+	te.dwSize = sizeof(te);
+	const DWORD pid = GetCurrentProcessId();
+	if (pFirst(snap, &te))
+	{
+		do
+		{
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+
+			HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+			                       THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+			if (!th) continue;
+
+			if (SuspendThread(th) != (DWORD)-1)
+			{
+				CONTEXT ctx;
+				memset(&ctx, 0, sizeof(ctx));
+				ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+				if (GetThreadContext(th, &ctx))
+				{
+					if (enable)
+					{
+						ctx.Dr0 = (DWORD64)(ULONG_PTR)addr;
+						// L0 on; RW0 = 01 (write); LEN0 = 10 (eight bytes).
+						ctx.Dr7 = (ctx.Dr7 & ~(DWORD64)0x000F0003ull) | 1ull | (1ull << 16) | (2ull << 18);
+					}
+					else
+					{
+						ctx.Dr0 = 0;
+						ctx.Dr7 &= ~(DWORD64)0x000F0003ull;
+					}
+					ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+					g_watchSeen++;
+					if (SetThreadContext(th, &ctx))
+					{
+						// Read it back: a debug register that silently refused to stick would
+						// make the whole measurement a lie.
+						CONTEXT back;
+						memset(&back, 0, sizeof(back));
+						back.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+						if (GetThreadContext(th, &back) && back.Dr0 == ctx.Dr0 && (back.Dr7 & 1) == (ctx.Dr7 & 1))
+							g_watchThreads++;
+					}
+				}
+				ResumeThread(th);
+			}
+			CloseHandle(th);
+		} while (pNext(snap, &te));
+	}
+	CloseHandle(snap);
+}
+
+// Reports the instruction the watchpoint caught, then disarms so one write is enough.
+static LONG CALLBACK WatchVEH(EXCEPTION_POINTERS* ep)
+{
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+	CONTEXT* c = ep->ContextRecord;
+	if (!(c->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+
+	c->Dr6 = 0;
+	c->Dr7 &= ~(DWORD64)0x000F0003ull;
+
+	if (InterlockedIncrement(&g_watchHits) <= 4)
+	{
+		char buf[1024];
+		ULONG_PTR rva = 0;
+		const char* mod = ModuleAt((ULONG_PTR)c->Rip, &rva);
+		int n = sprintf(buf, "=== watchpoint hit: write to 0x%016llX ===\n"
+		                     "  by            : %s+0x%08llX\n"
+		                     "  thread        : %lu\n",
+		                (unsigned long long)(ULONG_PTR)g_watchAddr,
+		                mod ? mod : "(unknown)", (unsigned long long)rva,
+		                (unsigned long)GetCurrentThreadId());
+		static const char* const names[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+		                                       "r8 ","r9 ","r10","r11","r12","r13","r14","r15" };
+		const ULONG_PTR regs[16] = { (ULONG_PTR)c->Rax, (ULONG_PTR)c->Rcx, (ULONG_PTR)c->Rdx,
+		                             (ULONG_PTR)c->Rbx, (ULONG_PTR)c->Rsp, (ULONG_PTR)c->Rbp,
+		                             (ULONG_PTR)c->Rsi, (ULONG_PTR)c->Rdi, (ULONG_PTR)c->R8,
+		                             (ULONG_PTR)c->R9,  (ULONG_PTR)c->R10, (ULONG_PTR)c->R11,
+		                             (ULONG_PTR)c->R12, (ULONG_PTR)c->R13, (ULONG_PTR)c->R14,
+		                             (ULONG_PTR)c->R15 };
+		for (int i = 0; i < 16; i += 4)
+			n += sprintf(buf + n, "    %s=%016llX %s=%016llX %s=%016llX %s=%016llX\n",
+			             names[i],   (unsigned long long)regs[i],
+			             names[i+1], (unsigned long long)regs[i+1],
+			             names[i+2], (unsigned long long)regs[i+2],
+			             names[i+3], (unsigned long long)regs[i+3]);
+		// The bytes at RIP name the instruction without needing a disassembler here.
+		n += sprintf(buf + n, "  bytes at rip  :");
+		for (int i = 0; i < 16; i++)
+			n += sprintf(buf + n, " %02X", ((const unsigned char*)c->Rip)[i]);
+		n += sprintf(buf + n, "\n  callers       :\n");
+		{
+			const ULONG_PTR* sp = (const ULONG_PTR*)c->Rsp;
+			int shown = 0;
+			for (int i = 0; i < 128 && shown < 8; i++)
+			{
+				ULONG_PTR v = 0;
+				if (!SafePeek(&sp[i], &v)) break;
+				ULONG_PTR r = 0;
+				const char* m = ModuleAt(v, &r);
+				if (!m) continue;
+				n += sprintf(buf + n, "    [rsp+%04X] %s+0x%08llX\n", (unsigned)(i * 8), m,
+				             (unsigned long long)r);
+				shown++;
+			}
+		}
+		n += sprintf(buf + n, "\n");
+		AppendFaultLog(buf, (unsigned long)n);
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Checks the renderer's constant-buffer arrays for overlap.
+//
+// Four arrays of 4096 bytes turned up 2080 bytes apart, which means the allocator handed out
+// blocks that sit inside one another - and every corrupted entry was at the same offset of
+// 1024 bytes. Whether that happens only when the arena is above the 4 GB line is the question
+// this answers, so it runs with the flag on and off.
+static void ReportCbLayout(unsigned char* rd)
+{
+	struct Blk { ULONG_PTR base; unsigned bytes; unsigned stage, type; };
+	Blk b[60];
+	int n = 0;
+	ULONG_PTR* const table = (ULONG_PTR*)(rd + CB_TABLE_RVA);
+	for (unsigned type = 0; type < 6; type++)
+	{
+		if (!CbCount(rd, type)) continue;
+		for (unsigned stage = 0; stage < 10; stage++)
+		{
+			ULONG_PTR base = 0;
+			if (!SafePeek(&table[stage + type * 10], &base) || !base) continue;
+			b[n].base = base; b[n].bytes = CbCount(rd, type) * 8;
+			b[n].stage = stage; b[n].type = type;
+			n++;
+		}
+	}
+	if (n < 2) return;
+
+	for (int i = 0; i < n - 1; i++)          // simple sort, sixty entries at most
+		for (int j = i + 1; j < n; j++)
+			if (b[j].base < b[i].base) { Blk tmp = b[i]; b[i] = b[j]; b[j] = tmp; }
+
+	char buf[4096];
+	int m = sprintf(buf, "=== constant-buffer arrays: %d blocks ===%s", n, "\n");
+	int overlaps = 0;
+	for (int i = 0; i < n; i++)
+	{
+		const ULONG_PTR end = b[i].base + b[i].bytes;
+		const char* note = "";
+		if (i + 1 < n && b[i + 1].base < end) { note = "  <- OVERLAPS the next block"; overlaps++; }
+		m += sprintf(buf + m, "  0x%016llX + %5u = 0x%016llX  stage %u type %u%s%s",
+		             (unsigned long long)b[i].base, b[i].bytes,
+		             (unsigned long long)end, b[i].stage, b[i].type, note, "\n");
+	}
+	m += sprintf(buf + m, "  overlapping blocks: %d%s%s", overlaps,
+	             overlaps ? "  <- the allocator handed out memory twice" : "", "\n\n");
+	AppendFaultLog(buf, (unsigned long)m);
+}
+
+static DWORD WINAPI CbWatchThread(LPVOID)
+{
+	unsigned char* rd = 0;
+	for (int i = 0; i < 600 && !rd; i++)
+	{
+		rd = (unsigned char*)GetModuleHandleA("CryRenderD3D11.dll");
+		if (!rd) Sleep(100);
+	}
+	if (!rd) return 0;
+
+	char line[256];
+	int n = sprintf(line, "--- cbwatch: CryRenderD3D11 at %p, table at %p ---\n",
+	                (void*)rd, (void*)(rd + CB_TABLE_RVA));
+	AppendTextFile("launcher_sites.txt", line, (unsigned long)n);
+
+	// Keep watching after the first report. The entry is cleared once it is described, so
+	// the renderer creates a fresh buffer and the watchpoint gets another chance at the
+	// writer - the first write happens before this thread can arm anything.
+	int reports = 0;
+	bool laidOut = false;
+	for (unsigned tick = 0; ; tick++)
+	{
+		ULONG_PTR* const table = (ULONG_PTR*)(rd + CB_TABLE_RVA);
+		if (!laidOut)
+		{
+			ULONG_PTR probe = 0;
+			if (SafePeek(&table[9 + 2 * 10], &probe) && probe)   // last array of the table
+			{
+				laidOut = true;
+				ReportCbLayout(rd);
+			}
+		}
+		for (unsigned type = 0; type < 6; type++)
+		{
+			const unsigned count = CbCount(rd, type);
+			if (!count) continue;
+			for (unsigned stage = 0; stage < 10; stage++)
+			{
+				ULONG_PTR base = 0;
+				if (!SafePeek(&table[stage + type * 10], &base)) continue;
+				if (!base || !LooksLikePointer(base)) continue;
+
+				const ULONG_PTR* arr = (const ULONG_PTR*)base;
+
+				// Index 128 of this particular array is what two runs in a row saw destroyed,
+				// so that is where the watchpoint goes. Re-arming every second catches threads
+				// the engine started after the last pass.
+				if (g_cbWatch && type == 1 && stage == 0 && g_watchHits == 0 && !g_watchAddr)
+				{
+					void* want = (void*)&arr[128];
+					if (g_watchAddr != want)
+					{
+						g_watchAddr = want;
+						g_watchThreads = g_watchSeen = 0;
+						ArmWriteWatch(want, true);
+						char wl[256];
+						ULONG_PTR now = 0;
+						SafePeek(want, &now);
+						int wn = sprintf(wl, "  watchpoint armed on 0x%016llX at tick %u: "
+						                     "%u of %u threads took it, entry is now 0x%016llX%s",
+						                 (unsigned long long)(ULONG_PTR)want, tick,
+						                 g_watchThreads, g_watchSeen,
+						                 (unsigned long long)now, "\n");
+						AppendFaultLog(wl, (unsigned long)wn);
+					}
+				}
+				for (unsigned i = 0; i < count; i++)
+				{
+					ULONG_PTR v = 0;
+					if (!SafePeek(&arr[i], &v)) break;
+					if (LooksLikePointer(v)) continue;
+
+					// Confirm it is not a pointer into something freshly mapped before saying
+					// anything: a false alarm here would cost another evening.
+					MEMORY_BASIC_INFORMATION mbi;
+					if (VirtualQuery((LPCVOID)v, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT)
+						continue;
+
+					// Report only. An earlier version cleared the entry to provoke a second write; with
+					// the wrong array size that wrote zeroes into a neighbouring block and killed runs
+					// that would otherwise have survived. A watcher must not touch what it watches.
+					if (++reports > 4) break;
+					char buf[4096];
+					int m = sprintf(buf,
+					                "=== constant-buffer table corrupted ===\n"
+					                "  stage %u, type %u, index %u of %u\n"
+					                "  array   : 0x%016llX (%u bytes)\n"
+					                "  entry   : 0x%016llX  <- not a pointer\n"
+					                "  around the entry:\n",
+					                stage, type, i, count,
+					                (unsigned long long)base, count * 8,
+					                (unsigned long long)v);
+					DumpAround((const unsigned char*)&arr[i], 64, 80, buf, &m);
+					// Could this be an arena address that lost its top half? The pool covers two whole
+					// gigabytes, so "the rebuilt address is inside the pool" is true of almost any low
+					// address and proves nothing on its own. Only a hit inside a committed arena - the
+					// first 512 KB of a 1 MB slot - is worth reporting.
+					{
+						const ULONG_PTR lo = (ULONG_PTR)g_arenaPool;
+						const ULONG_PTR hi = lo + (ULONG_PTR)ARENA_POOL_SLOTS * ARENA_SLOT_STRIDE;
+						const ULONG_PTR here = (ULONG_PTR)&arr[i];
+						bool found = false;
+						for (unsigned long long top = 1; top <= 16 && !found; top++)
+						{
+							const ULONG_PTR full = (ULONG_PTR)((top << 32) | (here & 0xFFFFFFFFull));
+							if (full < lo || full >= hi) continue;
+							if ((full - lo) % ARENA_SLOT_STRIDE >= BUCKET_ARENA_BYTES) continue;
+							found = true;
+							m += sprintf(buf + m, "  0x%016llX is 0x%016llX inside a committed arena%s",
+							             (unsigned long long)here, (unsigned long long)full, "\n");
+						}
+					}
+
+					// Every module carries its own copy of the engine's small-object allocator, and
+					// each copy writes its free-list heads 32 bits wide. Which copies are actually
+					// in use is a question only the running game answers - the renderer's copy,
+					// for one, turned out to be dead. Report them all.
+					m += sprintf(buf + m, "  free-list heads by module:%s", "\n");
+					{
+						static const char* const kMod[] = {
+							"CrySystem.dll", "CrySoundSystem.dll", "CryRenderD3D11.dll",
+							"Cry3DEngine.dll", "CryPhysics.dll", "CryGameReal.dll",
+						};
+						static const unsigned kRva[] = {
+							0x6F91A0, 0x0CADD0, 0x3A3F40, 0x2C1AF8, 0x228618, 0xA32D00,
+						};
+						for (int k = 0; k < 6; k++)
+						{
+							unsigned char* mb = (unsigned char*)GetModuleHandleA(kMod[k]);
+							if (!mb) { m += sprintf(buf + m, "    %-20s not loaded%s", kMod[k], "\n"); continue; }
+							const ULONG_PTR* h = (const ULONG_PTR*)(mb + kRva[k]);
+							unsigned used = 0, high = 0, bad = 0;
+							ULONG_PTR first = 0;
+							for (unsigned q = 0; q < 32; q++)
+							{
+								ULONG_PTR val = 0;
+								if (!SafePeek(&h[q], &val) || !val) continue;
+								used++;
+								if (!first) first = val;
+								if (val >= 0x100000000ull) high++;
+								if (!LooksLikePointer(val)) bad++;
+							}
+							m += sprintf(buf + m,
+							             "    %-20s %2u used, %2u above 4 GB, %u malformed, first 0x%016llX%s",
+							             kMod[k], used, high, bad, (unsigned long long)first, "\n");
+						}
+					}
+					m += sprintf(buf + m, "  start of the array:%s", "\n");
+					DumpAround((const unsigned char*)arr, 32, 32, buf, &m);
+					m += sprintf(buf + m, "%s", "\n");
+					AppendFaultLog(buf, (unsigned long)m);
+					break;
+				}
+			}
+		}
+		Sleep(100);
+	}
+	return 0;
+}
+
 static DWORD WINAPI SiteWatchThread(LPVOID)
 {
 	unsigned char* cs = (unsigned char*)GetModuleHandleA("CrySystem.dll");
@@ -2083,16 +2561,36 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	                GetCurrentProcess(), &g_mainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
 	// Diagnostic: follow the allocator globals and the trampoline counters while the game runs.
+	if (lpCmdLine && strstr(lpCmdLine, "-cbwatch")) g_cbWatch = true;
+
+	// Enlarge the renderer's constant-buffer cache before it is built.
+	//
+	// On by default, because the crash it prevents belongs to the stock 64-bit renderer and not
+	// to anything this launcher does: a control run with no launcher flags at all died after 55
+	// seconds at CryRenderD3D11+0x036F0E, reading entry 224 of a 128-entry array. -nocbfix turns
+	// it off for comparison.
+	if (!lpCmdLine || !strstr(lpCmdLine, "-nocbfix"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, CbFixThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
 	if (lpCmdLine && strstr(lpCmdLine, "-sitewatch"))
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, SiteWatchThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+
+		// And the renderer's own table, which is where the surviving crash lands.
+		th = CreateThread(NULL, 0, CbWatchThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
 
 #ifndef NO_DETECTOR
 	// Watch for pointers that lost their top half. Observes only; see TruncationVEH.
 	AddVectoredExceptionHandler(1, TruncationVEH);
+	// And the hardware watchpoint, which reports the writer rather than the damage.
+	AddVectoredExceptionHandler(1, WatchVEH);
 #endif
 
 	SSystemInitParams startupParams;
