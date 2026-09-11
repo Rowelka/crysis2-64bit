@@ -1152,7 +1152,7 @@ static unsigned char* g_cave     = 0;
 static size_t         g_caveUsed = 0;
 static const size_t   kCaveSize  = 0x1000;
 
-static unsigned char* AllocCaveNear(void* anchor)
+static unsigned char* AllocCaveNear(void* anchor, size_t size = kCaveSize)
 {
 	SYSTEM_INFO si;
 	GetSystemInfo(&si);
@@ -1161,12 +1161,12 @@ static unsigned char* AllocCaveNear(void* anchor)
 
 	for (ULONG_PTR off = gran; off < 0x30000000; off += gran)
 	{
-		void* p = VirtualAlloc((LPVOID)(base + off), kCaveSize,
+		void* p = VirtualAlloc((LPVOID)(base + off), size,
 		                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 		if (p) return (unsigned char*)p;
 		if (base > off)
 		{
-			p = VirtualAlloc((LPVOID)(base - off), kCaveSize,
+			p = VirtualAlloc((LPVOID)(base - off), size,
 			                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 			if (p) return (unsigned char*)p;
 		}
@@ -1276,43 +1276,105 @@ static const unsigned char kAiExpect[] = {
 	0xFF, 0x50, 0x38               // call qword ptr [rax + 0x38]
 };
 
-static unsigned long long  g_aiModLo = 0;   // lowest byte of any engine module
-static unsigned long long  g_aiModHi = 0;   // one past the highest
-static unsigned long long* g_aiBounds  = 0; // the two bounds, as the trampoline reads them
+static unsigned long long* g_aiCount   = 0; // how many ranges are filled in
+static unsigned long long* g_aiRanges  = 0; // pairs of (first byte, one past the last) per module
 static unsigned long long* g_aiRejects = 0; // candidates turned away; lives in the cave, so the
                                             // trampoline can reach it with a 32-bit offset -
                                             // a counter in the launcher is four gigabytes away.
 
-// The span the engine's own modules occupy. A table of methods lives inside one of them; the
-// heap does not. Computed rather than assumed, because module addresses differ between machines.
-static void MeasureEngineModules(void)
+#define AI_MAX_RANGES  1024
+#define AI_CAVE_SIZE   0x10000
+
+typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE*, DWORD, LPDWORD);
+static PFN_EnumProcessModules g_enumModules = 0;
+
+static bool FindEnumModules(void)
 {
-	static const char* const kMods[] = {
-		"CrySystem.dll", "CryAction.dll", "CryAISystem.dll", "CryEntitySystem.dll",
-		"CryAnimation.dll", "Cry3DEngine.dll", "CryPhysics.dll", "CryScriptSystem.dll",
-		"CryRenderD3D11.dll", "CryNetwork.dll", "CryMovie.dll", "CryFont.dll",
-		"CryInput.dll", "CrySoundSystem.dll", "CryGameReal.dll", "CryGameCrysis2.dll",
-	};
-	for (int i = 0; i < 16; i++)
+	if (g_enumModules) return true;
+	HMODULE k = GetModuleHandleA("kernel32.dll");
+	if (k) g_enumModules = (PFN_EnumProcessModules)GetProcAddress(k, "K32EnumProcessModules");
+	if (!g_enumModules)
 	{
-		HMODULE m = GetModuleHandleA(kMods[i]);
-		if (!m) continue;
-
-		MEMORY_BASIC_INFORMATION mbi;
-		if (!VirtualQuery((LPCVOID)m, &mbi, sizeof(mbi))) continue;
-
-		const unsigned long long lo = (unsigned long long)(ULONG_PTR)m;
-		// Walk the image's regions to find where it ends.
-		unsigned long long hi = lo;
-		for (int guard = 0; guard < 64; guard++)
-		{
-			if (!VirtualQuery((LPCVOID)(ULONG_PTR)hi, &mbi, sizeof(mbi))) break;
-			if (mbi.AllocationBase != (LPVOID)(ULONG_PTR)lo) break;
-			hi = (unsigned long long)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
-		}
-		if (!g_aiModLo || lo < g_aiModLo) g_aiModLo = lo;
-		if (hi > g_aiModHi) g_aiModHi = hi;
+		HMODULE ps = GetModuleHandleA("psapi.dll");
+		if (!ps) ps = LoadLibraryA("psapi.dll");
+		if (ps) g_enumModules = (PFN_EnumProcessModules)GetProcAddress(ps, "EnumProcessModules");
 	}
+	return g_enumModules != 0;
+}
+
+// Whether a module is one of the engine's own. Those hold the tables the check is looking
+// for nearly every time, so they are listed first and the walk usually ends within a few steps.
+static bool IsEngineModule(HMODULE m)
+{
+	char path[MAX_PATH];
+	if (!GetModuleFileNameA(m, path, MAX_PATH)) return false;
+
+	const char* name = path;
+	for (const char* s = path; *s; s++) if (*s == 92 || *s == '/') name = s + 1;
+
+	return (name[0] == 'C' || name[0] == 'c') && name[1] == 'r' && name[2] == 'y';
+}
+
+// One past the last byte a module occupies, from its own header.
+static unsigned long long ModuleEnd(HMODULE m)
+{
+	const unsigned char* base = (const unsigned char*)m;
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+	if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+	const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+	return (unsigned long long)(ULONG_PTR)base + nt->OptionalHeader.SizeOfImage;
+}
+
+// Lists every module the process has mapped, adding the ones not listed yet.
+//
+// The first attempt kept a single lowest..highest span instead, which measured 0x1C470000 to
+// 0x7FFEEFD9A000 in a real run - a hundred and forty terabytes, with the whole heap inside it.
+// It would have passed every destroyed object straight through. Modules land where the system
+// puts them and they are not neighbours, so each one needs its own pair.
+//
+// The list only grows and the count is raised last, so the trampoline reads it without locking:
+// it either sees a new entry or does not see it yet, never half of one. A module that unloads
+// leaves its range behind, which at worst lets one stale pointer through - exactly what the game
+// does without this fix.
+static int AiSyncModuleRanges(void)
+{
+	if (!g_aiRanges || !FindEnumModules()) return 0;
+
+	HMODULE mods[512];
+	DWORD needed = 0;
+	if (!g_enumModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return 0;
+
+	unsigned n = (unsigned)(needed / sizeof(HMODULE));
+	if (n > 512) n = 512;
+
+	int added = 0;
+	for (int pass = 0; pass < 2; pass++)
+	for (unsigned i = 0; i < n; i++)
+	{
+		if ((pass == 0) != IsEngineModule(mods[i])) continue;
+
+		const unsigned long long lo = (unsigned long long)(ULONG_PTR)mods[i];
+		const unsigned long long hi = ModuleEnd(mods[i]);
+		if (!hi || hi <= lo) continue;
+
+		const unsigned long long have = *g_aiCount;
+		unsigned long long k = 0;
+		for (; k < have; k++) if (g_aiRanges[k * 2] == lo) break;
+		if (k < have)
+		{
+			// Same base, bigger image: a module was replaced by a larger one.
+			if (hi > g_aiRanges[k * 2 + 1]) g_aiRanges[k * 2 + 1] = hi;
+			continue;
+		}
+		if (have >= AI_MAX_RANGES) return added;
+
+		g_aiRanges[have * 2 + 0] = lo;
+		g_aiRanges[have * 2 + 1] = hi;
+		InterlockedExchange64((LONGLONG volatile*)g_aiCount, (LONGLONG)(have + 1));
+		added++;
+	}
+	return added;
 }
 
 static const char* PatchAiDeadTarget(void)
@@ -1322,40 +1384,59 @@ static const char* PatchAiDeadTarget(void)
 
 	unsigned char* at = ai + AI_TARGET_CALL_RVA;
 	if (memcmp(at, kAiExpect, sizeof(kAiExpect)) != 0) return "no match";
+	if (!FindEnumModules()) return "no way to list modules";
 
-	MeasureEngineModules();
-	if (!g_aiModLo || g_aiModHi <= g_aiModLo) return "could not measure modules";
-
-	unsigned char* cave = AllocCaveNear(ai);
+	unsigned char* cave = AllocCaveNear(ai, AI_CAVE_SIZE);
 	if (!cave) return "no cave";
 
-	// Layout: bounds, counter, then code - all within reach of a rip-relative offset.
-	memcpy(cave + 0, &g_aiModLo, 8);
-	memcpy(cave + 8, &g_aiModHi, 8);
-	g_aiBounds  = (unsigned long long*)(cave + 0);
-	g_aiRejects = (unsigned long long*)(cave + 16);
+	// Layout: count, rejected, the ranges, then the code - all within reach of a rip-relative
+	// offset from the trampoline.
+	g_aiCount   = (unsigned long long*)(cave + 0);
+	g_aiRejects = (unsigned long long*)(cave + 8);
+	g_aiRanges  = (unsigned long long*)(cave + 16);
+	*g_aiCount   = 0;
 	*g_aiRejects = 0;
-	unsigned char* code = cave + 24;
+
+	if (AiSyncModuleRanges() <= 0) return "could not list modules";
+
+	unsigned char* code = cave + 16 + AI_MAX_RANGES * 16;
 	int n = 0;
 
 	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x02;            // mov rax, [rdx]
 
-	// cmp rax, [rip + (cave+0 - next)]
-	code[n++] = 0x48; code[n++] = 0x3B; code[n++] = 0x05;
+	code[n++] = 0x4C; code[n++] = 0x8D; code[n++] = 0x15;            // lea r10, [rip + ranges]
 	{
-		const long rel = (long)((cave + 0) - (code + n + 4));
+		const long rel = (long)((unsigned char*)g_aiRanges - (code + n + 4));
 		memcpy(code + n, &rel, 4); n += 4;
 	}
-	code[n++] = 0x72; const int fixLo = n; code[n++] = 0x00;         // jb  bad
+	code[n++] = 0x4C; code[n++] = 0x8B; code[n++] = 0x1D;            // mov r11, [rip + count]
+	{
+		const long rel = (long)((unsigned char*)g_aiCount - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
 
-	code[n++] = 0x48; code[n++] = 0x3B; code[n++] = 0x05;            // cmp rax, [rip + hi]
-	{
-		const long rel = (long)((cave + 8) - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
-	code[n++] = 0x73; const int fixHi = n; code[n++] = 0x00;         // jae bad
+	// Walk the ranges. r10 and r11 are scratch by the calling convention, and the flags are
+	// dead here, so nothing the engine is holding gets disturbed.
+	const int top = n;
+	code[n++] = 0x4D; code[n++] = 0x85; code[n++] = 0xDB;            // test r11, r11
+	code[n++] = 0x74; const int fixEmpty = n; code[n++] = 0x00;      // jz  bad
+
+	code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x02;            // cmp rax, [r10]
+	code[n++] = 0x72; const int fixBelow = n; code[n++] = 0x00;      // jb  next
+
+	code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x42; code[n++] = 0x08;  // cmp rax, [r10+8]
+	code[n++] = 0x72; const int fixInside = n; code[n++] = 0x00;     // jb  good
+
+	const int next = n;
+	code[fixBelow] = (unsigned char)(next - (fixBelow + 1));
+	code[n++] = 0x49; code[n++] = 0x83; code[n++] = 0xC2; code[n++] = 0x10; // add r10, 16
+	code[n++] = 0x49; code[n++] = 0xFF; code[n++] = 0xCB;            // dec r11
+	code[n++] = 0xEB;
+	code[n] = (unsigned char)(top - (n + 1)); n++;                   // jmp top
 
 	// Good: do exactly what the overwritten bytes did, then go back.
+	const int good = n;
+	code[fixInside] = (unsigned char)(good - (fixInside + 1));
 	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCA;            // mov rcx, rdx
 	code[n++] = 0xFF; code[n++] = 0x50; code[n++] = 0x38;            // call [rax + 0x38]
 	code[n++] = 0xE9;
@@ -1366,8 +1447,7 @@ static const char* PatchAiDeadTarget(void)
 
 	// Bad: count it and take the engine's own "no target" exit.
 	const int bad = n;
-	code[fixLo] = (unsigned char)(bad - (fixLo + 1));
-	code[fixHi] = (unsigned char)(bad - (fixHi + 1));
+	code[fixEmpty] = (unsigned char)(bad - (fixEmpty + 1));
 
 	code[n++] = 0x48; code[n++] = 0xFF; code[n++] = 0x05;            // inc qword ptr [rip+rel32]
 	{
@@ -1383,7 +1463,7 @@ static const char* PatchAiDeadTarget(void)
 	if (!WriteJump(at, code, sizeof(kAiExpect))) return "jump failed";
 
 	static char result[160];
-	sprintf(result, "applied (modules 0x%llX..0x%llX)", g_aiModLo, g_aiModHi);
+	sprintf(result, "applied (%llu modules listed)", *g_aiCount);
 	return result;
 }
 
@@ -1402,27 +1482,33 @@ static DWORD WINAPI AiFixThread(LPVOID)
 	int n = sprintf(line, "  aifix: dead-target check %s%s", r, "\n");
 	AppendFaultLog(line, (unsigned long)n);
 
-	// Keep measuring. CryGameReal maps well after CryAISystem and sits far below it, so a
-	// range taken once is too narrow - and too narrow here means live objects judged dead,
-	// and an AI that stops seeing anything at all. The bounds are plain data in the cave, so
-	// widening them is two stores that the trampoline picks up on its next call.
-	if (!g_aiBounds) return 0;
-	unsigned long long lo = g_aiModLo, hi = g_aiModHi;
-	for (int i = 0; i < 120; i++)
+	// Keep the list current. Modules map long after CryAISystem - CryGameReal among them - and a
+	// module missing from the list means live objects judged dead, which would leave the AI blind.
+	// Appending is two stores the trampoline picks up on its next call.
+	if (!g_aiRanges) return 0;
+	unsigned long long seen = 0;
+	for (int i = 0; ; i++)
 	{
-		Sleep(1000);
-		g_aiModLo = 0; g_aiModHi = 0;
-		MeasureEngineModules();
-		if (!g_aiModLo || g_aiModHi <= g_aiModLo) continue;
-		if (g_aiModLo >= lo && g_aiModHi <= hi) continue;
-		if (g_aiModLo < lo) lo = g_aiModLo;
-		if (g_aiModHi > hi) hi = g_aiModHi;
-		g_aiBounds[0] = lo;
-		g_aiBounds[1] = hi;
-		int m = sprintf(line, "  aifix: range widened to 0x%llX..0x%llX%s", lo, hi, "\n");
-		AppendFaultLog(line, (unsigned long)m);
+		Sleep(i < 60 ? 1000 : 5000);
+
+		const int added = AiSyncModuleRanges();
+		if (added > 0)
+		{
+			int m = sprintf(line, "  aifix: %d module(s) more, %llu listed%s",
+			                added, *g_aiCount, "\n");
+			AppendFaultLog(line, (unsigned long)m);
+		}
+
+		// Say when the check actually turned something away. Nothing here means the fix is
+		// sitting idle, and a steady climb would mean it is rejecting live objects instead.
+		const unsigned long long rej = *g_aiRejects;
+		if (rej != seen)
+		{
+			int m = sprintf(line, "  aifix: %llu dead target(s) turned away%s", rej, "\n");
+			AppendFaultLog(line, (unsigned long)m);
+			seen = rej;
+		}
 	}
-	return 0;
 }
 
 // Which corrections to apply, one bit per site: -enginefix turns on all eight,
