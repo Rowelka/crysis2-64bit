@@ -1591,6 +1591,285 @@ static const char* PatchSoundDeadObject(void)
 	return result;
 }
 
+// Makes the process ask the system for memory from the top of the address space.
+//
+// The game only survives as a 64-bit build because its memory happens to land below the 4 GB
+// line, where an address with its upper half lost still points at the right place. That is luck,
+// not a fix: every place that stores half a pointer is still there, waiting for a machine, a
+// driver or a level that pushes memory higher. MEM_TOP_DOWN flips the condition on purpose - the
+// system hands out the highest free address instead of the lowest - so those places fault here,
+// on demand, in a two-minute run.
+//
+// Two earlier attempts at the same exam failed for reasons that had nothing to do with
+// truncation. -forcehighheap reserved everything below 4 GB, and the renderer died because D3D
+// needs address space of its own. -highslab swapped what CryMalloc returned, and the allocator
+// died because it was handed bare memory with none of its own bookkeeping in it. This one changes
+// neither: the engine calls VirtualAlloc itself, gets its own memory and lays out its own
+// structures in it. Only the address is high.
+//
+// The hook goes in the import table of every module rather than into kernel32's code: one pointer
+// per module, nothing to disassemble, and a module that maps later is picked up on the next pass.
+typedef LPVOID (WINAPI *PFN_VA)(LPVOID, SIZE_T, DWORD, DWORD);
+
+static PFN_VA g_origVA = 0;
+static SIZE_T           g_topDownMin   = 64 * 1024;   // below this it is not worth the search
+static volatile LONG    g_topDownCalls = 0;
+static volatile LONG    g_topDownHigh  = 0;           // how many landed above 4 GB
+static unsigned long long g_topDownHighest = 0;
+static unsigned long long g_topDownLowest  = ~0ull;
+
+static LPVOID WINAPI TopDownVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
+{
+	const bool steer = (addr == NULL) && ((type & MEM_RESERVE) != 0) && (size >= g_topDownMin);
+	if (steer) type |= MEM_TOP_DOWN;
+
+	LPVOID p = g_origVA ? g_origVA(addr, size, type, protect)
+	                              : VirtualAlloc(addr, size, type, protect);
+	if (steer && p)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)p;
+		InterlockedIncrement(&g_topDownCalls);
+		if (a > 0xFFFFFFFFull) InterlockedIncrement(&g_topDownHigh);
+		if (a > g_topDownHighest) g_topDownHighest = a;
+		if (a < g_topDownLowest)  g_topDownLowest  = a;
+	}
+	return p;
+}
+
+// Replaces every import that currently points at 'from'. Matching by address rather than by name
+// catches the api-ms-win-core-memory forwarders as well, which is what most of these DLLs import.
+static int RedirectImportsByAddress(HMODULE mod, void* from, void* to)
+{
+	unsigned char* base = (unsigned char*)mod;
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+	if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+	const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+	const IMAGE_DATA_DIRECTORY* dir =
+		&nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (!dir->VirtualAddress || !dir->Size) return 0;
+
+	int done = 0;
+	const IMAGE_IMPORT_DESCRIPTOR* imp = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dir->VirtualAddress);
+	for (; imp->Name; imp++)
+	{
+		ULONG_PTR* thunk = (ULONG_PTR*)(base + imp->FirstThunk);
+		for (; *thunk; thunk++)
+		{
+			if ((void*)(ULONG_PTR)*thunk != from) continue;
+
+			DWORD old = 0;
+			if (!VirtualProtect(thunk, sizeof(*thunk), PAGE_READWRITE, &old)) continue;
+			*thunk = (ULONG_PTR)to;
+			VirtualProtect(thunk, sizeof(*thunk), old, &old);
+			done++;
+		}
+	}
+	return done;
+}
+
+// Every module mapped right now. Called again as modules appear, since the engine loads most of
+// its own long after the launcher starts.
+static int HookTopDownEverywhere(void)
+{
+	if (!g_origVA)
+	{
+		HMODULE k = GetModuleHandleA("kernel32.dll");
+		g_origVA = k ? (PFN_VA)GetProcAddress(k, "VirtualAlloc") : 0;
+		if (!g_origVA) return 0;
+	}
+	if (!FindEnumModules()) return 0;
+
+	HMODULE mods[512];
+	DWORD needed = 0;
+	if (!g_enumModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return 0;
+
+	unsigned n = (unsigned)(needed / sizeof(HMODULE));
+	if (n > 512) n = 512;
+
+	int done = 0;
+	for (unsigned i = 0; i < n; i++)
+		done += RedirectImportsByAddress(mods[i], (void*)g_origVA, (void*)TopDownVirtualAlloc);
+	return done;
+}
+
+static bool g_topDown = false;
+
+// The same steering, one level down.
+//
+// Hooking VirtualAlloc through the import tables turned out to catch almost nothing: the engine
+// takes its memory from the CRT, and the CRT goes to ntdll without passing through kernel32. A
+// run with only that hook reported not a single large reservation. NtAllocateVirtualMemory is
+// where they all end up - VirtualAlloc, HeapAlloc and the CRT alike - so the flag means something
+// only from here.
+//
+// The stub is five bytes of "mov r10, rcx" plus "mov eax, <number>", which is enough room for a
+// jump, and the copy of those bytes in the cave becomes the way to call the original.
+typedef LONG (__stdcall *PFN_NtAllocVM)(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
+
+static PFN_NtAllocVM      g_origNtAlloc = 0;
+static bool               g_topDownMax  = false;              // the very edge of the space
+static volatile LONGLONG  g_highCursor  = 0x200000000LL;      // 8 GB, and climbing
+
+// Memory high enough to expose a lost upper half, low enough that the rest of Windows still
+// works. MEM_TOP_DOWN hands out 0x00007FF4........, and at that height dsound.dll dies on its
+// own: it packs a pointer into 43 bits (the mask 0x000007FFFFFFFFF8 was sitting in rdi when it
+// faulted). Eight gigabytes up is plenty - the upper half of the address is non-zero, which is
+// all the exam needs - and leaves every packing scheme in the system intact.
+// Modules that still keep pointers in 32 bits somewhere, and so must be served from below the
+// 4 GB line until those places are found and widened.
+//
+//   CryScriptSystem - the Lua allocator swaps list heads with a 32-bit compare-and-exchange
+//                     (lock cmpxchg dword ptr [rcx], edx at 0x1700): half the pointer is never
+//                     written, so the head becomes garbage the moment the block is high.
+//   dsound          - packs a pointer into 43 bits; not the game's code, and not ours to fix.
+//
+// Each name removed from this list is one subsystem that has become genuinely 64-bit.
+static const char* const kNotReadyYet[] = {
+	"CryScriptSystem.dll",
+	"dsound.dll",
+	"dsound",
+};
+
+// Whether this allocation is being made on behalf of a module that is not ready. Reading the
+// stack costs something, but only large reservations get here - a few hundred over a whole run.
+static bool CalledByUnreadyModule(void)
+{
+	void* frames[12];
+	const USHORT n = CaptureStackBackTrace(1, 12, frames, NULL);
+
+	for (USHORT i = 0; i < n; i++)
+	{
+		HMODULE m = 0;
+		if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                        (LPCSTR)frames[i], &m) || !m)
+			continue;
+
+		char path[MAX_PATH];
+		if (!GetModuleFileNameA(m, path, MAX_PATH)) continue;
+
+		const char* name = path;
+		for (const char* s = path; *s; s++) if (*s == 92 || *s == '/') name = s + 1;
+
+		for (int k = 0; k < 3; k++)
+			if (_stricmp(name, kNotReadyYet[k]) == 0) return true;
+	}
+	return false;
+}
+
+static volatile LONG g_highSkipped = 0;   // allocations left low on purpose
+
+static LONG TryHighAt(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size,
+                      ULONG type, ULONG protect)
+{
+	const SIZE_T want = *size;
+
+	for (int attempt = 0; attempt < 24; attempt++)
+	{
+		const LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, 0x4000000LL);  // 64 MB apart
+		if (at > 0x4000000000LL) return -1;                                        // past 256 GB
+
+		PVOID p = (PVOID)(ULONG_PTR)at;
+		SIZE_T sz = want;
+		const LONG st = orig(proc, &p, 0, &sz, type, protect);
+		if (st >= 0)
+		{
+			*base = p;
+			*size = sz;
+			return st;
+		}
+	}
+	return -1;
+}
+
+static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBits,
+                                     SIZE_T* size, ULONG type, ULONG protect)
+{
+	const bool steer = base && (*base == NULL) && size && (*size >= g_topDownMin) &&
+	                   ((type & MEM_RESERVE) != 0) && (proc == (HANDLE)(LONG_PTR)-1);
+
+	if (steer && CalledByUnreadyModule())
+	{
+		InterlockedIncrement(&g_highSkipped);
+		return g_origNtAlloc(proc, base, zeroBits, size, type, protect);
+	}
+
+	LONG st;
+	if (steer && !g_topDownMax)
+	{
+		st = TryHighAt(g_origNtAlloc, proc, base, size, type, protect);
+		if (st >= 0)
+		{
+			const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+			InterlockedIncrement(&g_topDownCalls);
+			if (a > 0xFFFFFFFFull) InterlockedIncrement(&g_topDownHigh);
+			if (a > g_topDownHighest) g_topDownHighest = a;
+			if (a < g_topDownLowest)  g_topDownLowest  = a;
+			return st;
+		}
+		*base = NULL;          // the attempts left it set; hand the original a clean request
+	}
+	else if (steer)
+	{
+		type |= MEM_TOP_DOWN;
+	}
+
+	st = g_origNtAlloc(proc, base, zeroBits, size, type, protect);
+
+	if (steer && st >= 0 && base && *base)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+		InterlockedIncrement(&g_topDownCalls);
+		if (a > 0xFFFFFFFFull) InterlockedIncrement(&g_topDownHigh);
+		if (a > g_topDownHighest) g_topDownHighest = a;
+		if (a < g_topDownLowest)  g_topDownLowest  = a;
+	}
+	return st;
+}
+
+static const char* HookNtAlloc(void)
+{
+	if (g_origNtAlloc) return "already";
+
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	if (!nt) return "no ntdll";
+
+	unsigned char* at = (unsigned char*)GetProcAddress(nt, "NtAllocateVirtualMemory");
+	if (!at) return "no NtAllocateVirtualMemory";
+
+	// mov r10, rcx ; mov eax, imm32   - the shape of every syscall stub on this Windows.
+	if (!(at[0] == 0x4C && at[1] == 0x8B && at[2] == 0xD1 && at[3] == 0xB8))
+		return "unfamiliar stub";
+
+	unsigned char* cave = AllocCaveNear(at);
+	if (!cave) return "no cave";
+
+	// The original, callable: the eight bytes we are about to overwrite, then back to the rest.
+	memcpy(cave, at, 8);
+	cave[8] = 0xE9;
+	{
+		const long rel = (long)((at + 8) - (cave + 13));
+		memcpy(cave + 9, &rel, 4);
+	}
+	g_origNtAlloc = (PFN_NtAllocVM)cave;
+
+	// A 32-bit jump cannot reach across the address space, so the detour goes through an
+	// absolute jump parked in the same cave: jmp [rip+0] followed by the address itself.
+	// ('far' is still a macro in this compiler's headers, hence the name.)
+	unsigned char* pad = cave + 32;
+	pad[0] = 0xFF; pad[1] = 0x25; pad[2] = 0x00; pad[3] = 0x00; pad[4] = 0x00; pad[5] = 0x00;
+	{
+		void* target = (void*)SteeredNtAlloc;
+		memcpy(pad + 6, &target, 8);
+	}
+
+	if (!WriteJump(at, pad, 8)) { g_origNtAlloc = 0; return "jump failed"; }
+	return "applied";
+}
+
 // Keeps every table current, and says what the checks turned away.
 //
 // Modules map long after the first patch goes in - CryGameReal among them - and a module missing
@@ -1609,6 +1888,33 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		const unsigned step = (i < 60) ? 1 : 5;
 		Sleep(step * 1000);
 		elapsed += step;
+
+		if (g_topDown)
+		{
+			HookTopDownEverywhere();
+
+			// Proof the interception happens at all. Without this line a silent log cannot
+			// tell "nothing went high" from "the hook is never called".
+			static bool saidLive = false;
+			if (!saidLive && g_topDownCalls > 0)
+			{
+				int m = sprintf(line, "  topdown: steering, %ld so far, %ld above 4 GB, "
+				                "%ld left low, top 0x%llX%s", g_topDownCalls, g_topDownHigh,
+				                g_highSkipped, g_topDownHighest, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+				saidLive = true;
+			}
+
+			static bool saidHigh = false;
+			if (!saidHigh && g_topDownHigh > 0)
+			{
+				int m = sprintf(line, "  topdown: memory is landing high, %ld of %ld above 4 GB,"
+				                " top 0x%llX%s", g_topDownHigh, g_topDownCalls,
+				                g_topDownHighest, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+				saidHigh = true;
+			}
+		}
 
 		const int added = SyncModuleRanges();
 		if (added > 0 && g_mrTables > 0)
@@ -1644,6 +1950,15 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		// crash still leaves the last of these in the log.
 		if (elapsed < nextReport) continue;
 		nextReport += 300;
+
+		if (g_topDown)
+		{
+			int m = sprintf(line, "  topdown: %ld steered, %ld above 4 GB, 0x%llX..0x%llX%s",
+			                g_topDownCalls, g_topDownHigh,
+			                (g_topDownLowest == ~0ull) ? 0 : g_topDownLowest,
+			                g_topDownHighest, "\n");
+			AppendFaultLog(line, (unsigned long)m);
+		}
 		for (int k = 0; k < g_mrTables; k++)
 		{
 			const unsigned long long ok = *MR_ACCEPT(g_mrTable[k]);
@@ -1699,6 +2014,314 @@ static DWORD WINAPI SoundFixThread(LPVOID)
 	AppendFaultLog(line, (unsigned long)n);
 
 	if (g_mrTables > 0) StartRangeKeeper();
+	return 0;
+}
+
+// The same truncation, in the other modules.
+//
+// The engine's bucket allocator is not one piece of code in CrySystem - every module carries its
+// own compiled copy, with its own globals. The corrections made so far cover CrySystem's copy
+// only, which was enough while everything lived below the 4 GB line.
+//
+// A run with -topdown proved it is not enough. The game died writing to 0x00000000FD333518 with
+// rax = 0x00000000FD333510 while rdx held 0x00007FF4FD333528 - the same pointer, upper half
+// gone. The faulting instruction was in CrySoundSystem, reading a global that another
+// instruction had written with a 32-bit store.
+//
+// Auditing every module for "written 32, read 64" then found the same four globals, in the same
+// order, in CrySoundSystem, CryRenderD3D11 and CryRenderD3D9. Eight stores each.
+//
+// Two shapes, two repairs:
+//   REX form (7 or 8 bytes) - one bit turns the store into a 64-bit one, length unchanged.
+//   rip-relative form (6 bytes) - the 64-bit version needs a seventh byte, so it goes through a
+//   trampoline, exactly like sites 3 to 5 in CrySystem.
+struct WidenSite
+{
+	unsigned             rva;
+	const unsigned char* bytes;
+	unsigned             len;
+};
+
+// CrySoundSystem.dll - this is the copy that actually crashed.
+static const unsigned char kSnd0[] = { 0x89, 0x2D, 0xF8, 0x7C, 0x0B, 0x00 };
+static const unsigned char kSnd1[] = { 0x89, 0x2D, 0xD1, 0x7C, 0x0B, 0x00 };
+static const unsigned char kSnd2[] = { 0x89, 0x05, 0x8E, 0x7E, 0x0B, 0x00 };
+static const unsigned char kSnd3[] = { 0x44, 0x89, 0x15, 0x36, 0x7E, 0x0B, 0x00 };
+static const unsigned char kSnd4[] = { 0x89, 0x0D, 0xCA, 0x7C, 0x0B, 0x00 };
+static const unsigned char kSnd5[] = { 0x47, 0x89, 0x94, 0xC8, 0xD0, 0xAD, 0x0C, 0x00 };
+static const unsigned char kSnd6[] = { 0x8B, 0x03,                       // mov eax, [rbx]
+                                       0x41, 0x89, 0x84, 0xED, 0xD0, 0xAD, 0x0C, 0x00 };
+static const unsigned char kSnd7[] = { 0x45, 0x89, 0xA4, 0xDB, 0xD0, 0xAD, 0x0C, 0x00 };
+
+static const WidenSite kSndSites[] = {
+	{ 0x0130AA, kSnd0, sizeof(kSnd0) },
+	{ 0x0130C9, kSnd1, sizeof(kSnd1) },
+	{ 0x012F2C, kSnd2, sizeof(kSnd2) },
+	{ 0x012F83, kSnd3, sizeof(kSnd3) },
+	{ 0x0130F0, kSnd4, sizeof(kSnd4) },
+	{ 0x01354D, kSnd5, sizeof(kSnd5) },
+	{ 0x013B41, kSnd6, sizeof(kSnd6) },
+	{ 0x013C60, kSnd7, sizeof(kSnd7) },
+};
+
+// CryRenderD3D11.dll - same allocator, same four globals.
+static const unsigned char kR11_0[] = { 0x45, 0x89, 0xA4, 0xDB, 0x40, 0x3F, 0x3A, 0x00 };
+static const unsigned char kR11_1[] = { 0x47, 0x89, 0x94, 0xC8, 0x40, 0x3F, 0x3A, 0x00 };
+static const unsigned char kR11_2[] = { 0x8B, 0x03,
+                                        0x41, 0x89, 0x84, 0xED, 0x40, 0x3F, 0x3A, 0x00 };
+static const unsigned char kR11_3[] = { 0x89, 0x05, 0xAE, 0x75, 0x16, 0x00 };
+static const unsigned char kR11_4[] = { 0x44, 0x89, 0x15, 0x56, 0x75, 0x16, 0x00 };
+static const unsigned char kR11_5[] = { 0x89, 0x0D, 0xAF, 0x73, 0x16, 0x00 };
+static const unsigned char kR11_6[] = { 0x89, 0x35, 0x5E, 0x3D, 0x1B, 0x00 };
+static const unsigned char kR11_7[] = { 0x89, 0x35, 0x85, 0x3D, 0x1B, 0x00 };
+
+static const WidenSite kR11Sites[] = {
+	{ 0x23EEEF, kR11_0, sizeof(kR11_0) },
+	{ 0x23F12F, kR11_1, sizeof(kR11_1) },
+	{ 0x240C1F, kR11_2, sizeof(kR11_2) },
+	{ 0x23E7CC, kR11_3, sizeof(kR11_3) },
+	{ 0x23E823, kR11_4, sizeof(kR11_4) },
+	{ 0x23E9CB, kR11_5, sizeof(kR11_5) },
+	{ 0x23E9A4, kR11_6, sizeof(kR11_6) },
+	{ 0x23E985, kR11_7, sizeof(kR11_7) },
+};
+
+// CryRenderD3D9.dll - not loaded in DX11 mode, but the same mine is in it.
+static const unsigned char kR9_0[] = { 0x45, 0x89, 0xA4, 0xDB, 0x30, 0x92, 0x3B, 0x00 };
+static const unsigned char kR9_1[] = { 0x47, 0x89, 0x94, 0xC8, 0x30, 0x92, 0x3B, 0x00 };
+static const unsigned char kR9_2[] = { 0x8B, 0x03,
+                                       0x41, 0x89, 0x84, 0xED, 0x30, 0x92, 0x3B, 0x00 };
+static const unsigned char kR9_3[] = { 0x89, 0x05, 0x8E, 0x1E, 0x18, 0x00 };
+static const unsigned char kR9_4[] = { 0x44, 0x89, 0x15, 0x36, 0x1E, 0x18, 0x00 };
+static const unsigned char kR9_5[] = { 0x89, 0x0D, 0x8F, 0x1C, 0x18, 0x00 };
+static const unsigned char kR9_6[] = { 0x89, 0x35, 0x2E, 0xD4, 0x1C, 0x00 };
+static const unsigned char kR9_7[] = { 0x89, 0x35, 0x55, 0xD4, 0x1C, 0x00 };
+
+static const WidenSite kR9Sites[] = {
+	{ 0x23998F, kR9_0, sizeof(kR9_0) },
+	{ 0x239BCF, kR9_1, sizeof(kR9_1) },
+	{ 0x23B74F, kR9_2, sizeof(kR9_2) },
+	{ 0x2391DC, kR9_3, sizeof(kR9_3) },
+	{ 0x239233, kR9_4, sizeof(kR9_4) },
+	{ 0x2393DB, kR9_5, sizeof(kR9_5) },
+	{ 0x2393B4, kR9_6, sizeof(kR9_6) },
+	{ 0x239395, kR9_7, sizeof(kR9_7) },
+};
+
+// Turns one 32-bit store into a 64-bit one. Returns 0 on success, or a reason.
+static const char* WidenStore(unsigned char* base, const WidenSite* s, unsigned char** cave,
+                              size_t* caveUsed)
+{
+	unsigned char* at = base + s->rva;
+	if (memcmp(at, s->bytes, s->len) != 0)
+	{
+		// Already done? The REX form is the only one that can be recognised after the fact.
+		if (s->bytes[0] >= 0x40 && s->bytes[0] <= 0x4F && at[0] == (s->bytes[0] | 0x08))
+			return 0;
+		return "no match";
+	}
+
+	// REX form: set W and the same instruction stores eight bytes.
+	if (s->bytes[0] >= 0x40 && s->bytes[0] <= 0x4F)
+	{
+		const unsigned char rex = (unsigned char)(s->bytes[0] | 0x08);
+		return WriteBytes(at, &rex, 1) ? 0 : "write failed";
+	}
+
+	// The list walk: "mov eax, [reg]" reads the next block's address with half of it missing,
+	// and the store puts that half back as the new head. Both halves of the bug are two
+	// instructions apart, so one trampoline replaces the pair.
+	//
+	//   8B 03                     mov eax, dword ptr [rbx]
+	//   41 89 84 ED <disp32>      mov dword ptr [r13 + rbp*8 + heads], eax
+	//
+	// becomes the same thing 64 bits wide. The displacement is relative to r13, which the
+	// function loads with the module's own base, so it survives the move into the cave.
+	const bool isPair = (s->bytes[0] == 0x8B && s->len == 10);
+
+	if (!isPair && (s->bytes[0] != 0x89 || (s->bytes[1] & 0xC7) != 0x05)) return "unknown shape";
+
+	if (!*cave)
+	{
+		*cave = AllocCaveNear(base);
+		*caveUsed = 0;
+		if (!*cave) return "no cave";
+	}
+	if (*caveUsed + 24 > kCaveSize) return "cave full";
+
+	unsigned char* code = *cave + *caveUsed;
+	int n = 0;
+
+	if (isPair)
+	{
+		code[n++] = 0x48; code[n++] = 0x8B; code[n++] = s->bytes[1];       // mov rax, [reg]
+		code[n++] = (unsigned char)(s->bytes[2] | 0x08);                   // REX.W on the store
+		code[n++] = s->bytes[3]; code[n++] = s->bytes[4]; code[n++] = s->bytes[5];
+		memcpy(code + n, s->bytes + 6, 4); n += 4;                         // displacement, as is
+	}
+	else
+	{
+		long disp = 0;
+		memcpy(&disp, s->bytes + 2, 4);
+		unsigned char* target = at + s->len + disp;      // the global being written
+
+		code[n++] = 0x48; code[n++] = 0x89; code[n++] = s->bytes[1];
+		const long rel = (long)(target - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+
+	code[n++] = 0xE9;
+	{
+		const long rel = (long)((at + s->len) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+	*caveUsed += (size_t)n;
+
+	return WriteJump(at, code, s->len) ? 0 : "jump failed";
+}
+
+// Where each copy keeps its 32 free-list heads. All zero means the allocator has not served a
+// single block yet, which is the only moment it is safe to change how it stores pointers.
+static unsigned HeadsRvaFor(const char* name)
+{
+	if (_stricmp(name, "CrySoundSystem.dll") == 0) return 0x0CADD0;
+	if (_stricmp(name, "CryRenderD3D11.dll") == 0) return 0x3A3F40;
+	if (_stricmp(name, "CryRenderD3D9.dll")  == 0) return 0x3B9230;
+	return 0;
+}
+
+static bool AllocatorUntouched(unsigned char* base, const char* name)
+{
+	const unsigned rva = HeadsRvaFor(name);
+	if (!rva) return true;
+
+	const ULONG_PTR* heads = (const ULONG_PTR*)(base + rva);
+	for (unsigned i = 0; i < 32; i++)
+	{
+		ULONG_PTR v = 0;
+		if (SafePeek(&heads[i], &v) && v) return false;
+	}
+	return true;
+}
+
+static const char* WidenModule(const char* name, const WidenSite* sites, unsigned count)
+{
+	static char result[192];
+
+	unsigned char* base = (unsigned char*)GetModuleHandleA(name);
+	if (!base) { sprintf(result, "%s: not loaded", name); return result; }
+
+	// Too late is worse than not at all: a half-truncated free list plus correct stores is a mix
+	// the allocator cannot walk. A run that patched CrySoundSystem after it had started left the
+	// game stuck at 69 MB, never finishing the load.
+	if (!AllocatorUntouched(base, name))
+	{
+		sprintf(result, "%s: ALREADY RUNNING, left alone", name);
+		return result;
+	}
+
+	unsigned char* cave = 0;
+	size_t used = 0;
+	unsigned done = 0, skipped = 0;
+	const char* firstReason = 0;
+
+	for (unsigned i = 0; i < count; i++)
+	{
+		const char* why = WidenStore(base, &sites[i], &cave, &used);
+		if (!why) done++;
+		else { skipped++; if (!firstReason) firstReason = why; }
+	}
+
+	if (skipped) sprintf(result, "%s: %u of %u widened (%s)", name, done, count, firstReason);
+	else         sprintf(result, "%s: all %u widened", name, count);
+	return result;
+}
+
+// Which modules carry a copy, and where.
+static const struct { const char* name; const WidenSite* sites; unsigned count; } kWidenWork[] = {
+	{ "CrySoundSystem.dll", kSndSites, 8 },
+	{ "CryRenderD3D11.dll", kR11Sites, 8 },
+	{ "CryRenderD3D9.dll",  kR9Sites,  8 },
+};
+
+static volatile LONG g_widened[3] = { 0, 0, 0 };
+
+// Widens one module if it is loaded and has not been done yet. Safe to call from anywhere.
+static void WidenIfNeeded(int i)
+{
+	if (i < 0 || i > 2) return;
+	if (InterlockedCompareExchange(&g_widened[i], 1, 0) != 0) return;
+	if (!GetModuleHandleA(kWidenWork[i].name)) { g_widened[i] = 0; return; }
+
+	const char* r = WidenModule(kWidenWork[i].name, kWidenWork[i].sites, kWidenWork[i].count);
+	char line[224];
+	int n = sprintf(line, "  modfix: %s%s", r, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
+// The loader tells us the moment a module is mapped, before whoever called LoadLibrary gets
+// control back. The watching thread below was too late: CrySoundSystem's allocator had already
+// handed out memory and crashed by the time the thread noticed the module existed.
+typedef struct { USHORT Length; USHORT MaximumLength; PWSTR Buffer; } LDR_USTRING;
+
+typedef struct {
+	ULONG              Flags;
+	const LDR_USTRING* FullDllName;
+	const LDR_USTRING* BaseDllName;
+	PVOID              DllBase;
+	ULONG              SizeOfImage;
+} LDR_NOTIFICATION_DATA;
+
+typedef VOID (CALLBACK *PFN_LdrNotify)(ULONG, const LDR_NOTIFICATION_DATA*, PVOID);
+typedef LONG (NTAPI *PFN_LdrRegister)(ULONG, PFN_LdrNotify, PVOID, PVOID*);
+
+static PVOID g_ldrCookie = 0;
+
+static VOID CALLBACK OnModuleLoaded(ULONG reason, const LDR_NOTIFICATION_DATA* data, PVOID)
+{
+	if (reason != 1 || !data || !data->BaseDllName || !data->BaseDllName->Buffer) return;
+
+	// The name arrives as wide characters; compare the ASCII way, it is all ASCII here.
+	char name[64];
+	const PWSTR w = data->BaseDllName->Buffer;
+	unsigned k = 0;
+	for (; k < sizeof(name) - 1 && w[k]; k++) name[k] = (char)w[k];
+	name[k] = 0;
+
+	for (int i = 0; i < 3; i++)
+		if (_stricmp(name, kWidenWork[i].name) == 0) WidenIfNeeded(i);
+}
+
+static bool RegisterLoaderNotification(void)
+{
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	if (!nt) return false;
+
+	PFN_LdrRegister reg = (PFN_LdrRegister)GetProcAddress(nt, "LdrRegisterDllNotification");
+	if (!reg) return false;
+
+	return reg(0, OnModuleLoaded, NULL, &g_ldrCookie) >= 0;
+}
+
+// Runs once each module is mapped. They map at very different times, so each gets its own wait.
+static DWORD WINAPI ModuleFixThread(LPVOID)
+{
+	const bool early = RegisterLoaderNotification();
+
+	char line[160];
+	int n = sprintf(line, "  modfix: loader notification %s%s",
+	                early ? "registered" : "UNAVAILABLE, polling instead", "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	// Anything already mapped when we got here, plus a slow safety net if the notification is
+	// not available on this Windows.
+	for (int k = 0; k < 24000; k++)
+	{
+		for (int i = 0; i < 3; i++)
+			if (!g_widened[i] && GetModuleHandleA(kWidenWork[i].name)) WidenIfNeeded(i);
+		if (early && g_widened[0] && g_widened[1]) break;
+		Sleep(5);
+	}
 	return 0;
 }
 
@@ -1939,27 +2562,6 @@ static size_t   g_lowLeft    = 0;      // small blocks left free on purpose
 // allocator's slab lands above the line while everything else, the renderer included, keeps
 // getting memory where it always did. If the engine runs with its slab up there, the truncation
 // really is gone rather than merely dormant.
-typedef LPVOID (WINAPI *VirtualAllocFn)(LPVOID, SIZE_T, DWORD, DWORD);
-static VirtualAllocFn g_realVirtualAlloc = 0;
-
-static LPVOID WINAPI HighVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
-{
-	if (!addr && g_highThreshold && size >= g_highThreshold && (type & MEM_RESERVE))
-	{
-		for (ULONGLONG base = 0x200000000ULL; base < 0x1000000000ULL; base += 0x10000000ULL)
-		{
-			LPVOID p = g_realVirtualAlloc((LPVOID)base, size, type, prot);
-			if (p)
-			{
-				g_highTaken++;
-				return p;
-			}
-		}
-		g_highMissed++;
-	}
-	return g_realVirtualAlloc(addr, size, type, prot);
-}
-
 // Redirects one imported function of a loaded module to a replacement, returning the original.
 static bool HookImport(HMODULE mod, const char* dll, const char* func, void* repl, void** orig)
 {
@@ -3160,19 +3762,52 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// rather than finding out it does not at the moment a crash finally happens.
 	if (lpCmdLine && strstr(lpCmdLine, "-dumptest")) WriteRichDump(NULL);
 
-	// Guard the AI against calling into a destroyed target. Behind a flag until it has been
-	// played with: it changes engine behaviour, unlike the corrections, which restore it.
-	if (lpCmdLine && strstr(lpCmdLine, "-aifix"))
+	// Guard the AI and the sound engine against calling into a destroyed object. On by default
+	// now that a play session has measured them: 16706 and 83861 calls in five minutes, none of
+	// them turned away, so they cost a walk over a short list and touch nothing that is healthy.
+	// -noaifix and -nosndfix turn them off.
+	if (!lpCmdLine || !strstr(lpCmdLine, "-noaifix"))
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, AiFixThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
 
-	if (lpCmdLine && strstr(lpCmdLine, "-sndfix"))
+	if (!lpCmdLine || !strstr(lpCmdLine, "-nosndfix"))
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, SoundFixThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
+
+	// -topdown[:KB] steers large reservations to the top of the address space, where a lost upper
+	// half is fatal instead of harmless. The exam for "is this really a 64-bit build".
+	if (lpCmdLine && strstr(lpCmdLine, "-topdown"))
+	{
+		const char* at = strstr(lpCmdLine, "-topdown:");
+		if (at)
+		{
+			const unsigned kb = (unsigned)atoi(at + 9);
+			if (kb) g_topDownMin = (SIZE_T)kb * 1024;
+		}
+		g_topDown = true;
+		if (strstr(lpCmdLine, "-topdown:max")) g_topDownMax = true;
+
+		const int hooked = HookTopDownEverywhere();
+		const char* deep = HookNtAlloc();
+		char line[160];
+		int n = sprintf(line, "  topdown: on, %d import(s) redirected, ntdll %s, threshold %u KB%s",
+		                hooked, deep, (unsigned)(g_topDownMin / 1024), "\n");
+		AppendFaultLog(line, (unsigned long)n);
+		StartRangeKeeper();   // it re-hooks modules as they map
+	}
+
+	// The same widening in the modules that carry their own copy of the allocator. Behind a flag
+	// until it has been run with: CrySystem's copy took a week to get right.
+	if (lpCmdLine && strstr(lpCmdLine, "-modfix"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, ModuleFixThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
 

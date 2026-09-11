@@ -81,6 +81,8 @@ your machine and not on mine" into something answerable:
 | `-noenginefix` | leave the pointer-width corrections out (they are applied by default) |
 | `-enginefix:<mask>` | apply only selected correction sites, one bit each, for comparison |
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
+| `-noaifix` | let the AI call into a destroyed target, as the game does |
+| `-nosndfix` | let the sound engine call into a destroyed object, as the game does |
 | `-arenahigh` | serve the allocator's arenas from above the 4 GB line, to exercise the corrections |
 | `-cbwatch` | arm a hardware watchpoint on the constant-buffer cache (suspends every thread once) |
 
@@ -270,6 +272,8 @@ Command line flags:
 | `-forcehighheap` | force the heap above the 4 GB line, to reproduce truncation on demand |
 | `-noenginefix` | leave the pointer-width corrections out (applied by default) |
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
+| `-noaifix` | let the AI call into a destroyed target |
+| `-nosndfix` | let the sound engine call into a destroyed object |
 | `-arenahigh` | serve allocator arenas from above the 4 GB line |
 
 ## Building
