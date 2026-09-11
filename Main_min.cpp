@@ -477,6 +477,70 @@ static bool SafePeek(const void* at, ULONG_PTR* out)
 	return true;
 }
 
+// Writes a dump that still has the memory in it.
+//
+// The engine writes its own error.dmp, but it is a thin one: the Downtown crash left a stack
+// saying a virtual call went to address zero, and the object it was called on was not in the
+// dump at all - so there was no way to see whose object it was or what had happened to it.
+//
+// MiniDumpWithIndirectlyReferencedMemory adds the memory pointed at by registers and by values
+// on the stack, which is exactly the missing piece, without the cost of dumping three gigabytes.
+// dbghelp.dll is already loaded by the engine; failing to find it just means no extra dump.
+static volatile LONG g_dumpsWritten = 0;
+
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump)(HANDLE, DWORD, HANDLE, DWORD,
+                                             void*, void*, void*);
+
+static void WriteRichDump(EXCEPTION_POINTERS* ep)
+{
+	if (InterlockedIncrement(&g_dumpsWritten) > 2) return;   // two is plenty
+
+	HMODULE dbg = GetModuleHandleA("dbghelp.dll");
+	if (!dbg) dbg = LoadLibraryA("dbghelp.dll");
+	if (!dbg) return;
+
+	PFN_MiniDumpWriteDump write = (PFN_MiniDumpWriteDump)GetProcAddress(dbg, "MiniDumpWriteDump");
+	if (!write) return;
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	CreateDirectoryA("launcher_logs", NULL);
+	char path[MAX_PATH];
+	sprintf(path, "launcher_logs%clauncher_%04u%02u%02u_%02u%02u%02u.dmp", 92,
+	        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+	HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+	                       FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) return;
+
+	// MINIDUMP_EXCEPTION_INFORMATION, declared inline to avoid pulling in dbghelp.h.
+	struct { DWORD ThreadId; EXCEPTION_POINTERS* Pointers; BOOL ClientPointers; } mei;
+	mei.ThreadId = GetCurrentThreadId();
+	mei.Pointers = ep;
+	mei.ClientPointers = FALSE;
+
+	// Deliberately NOT MiniDumpWithFullMemory (0x2): that writes the whole address space, a
+	// three-gigabyte file a dying process rarely finishes. The first attempt used it by
+	// mistake and left a zero-byte dump behind.
+	const DWORD kType = 0x00000004      // WithHandleData
+	                  | 0x00000040      // WithIndirectlyReferencedMemory - the piece that matters
+	                  | 0x00000800      // WithFullMemoryInfo - the map of what is mapped
+	                  | 0x00001000;     // WithThreadInfo
+	// With no exception to describe, the structure must not be passed at all: handing
+	// MiniDumpWriteDump an exception record whose pointers are null takes the call down
+	// with it, which is how the self-test produced a zero-byte file twice.
+	const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), h, kType,
+	                      ep ? &mei : NULL, NULL, NULL);
+	const DWORD err = ok ? 0 : GetLastError();
+	const DWORD size = GetFileSize(h, NULL);
+	CloseHandle(h);
+
+	char line[MAX_PATH + 96];
+	int n = sprintf(line, "  %s dump: %s (%u bytes, error %u)%s",
+	                ok ? "wrote" : "FAILED to write", path,
+	                (unsigned)size, (unsigned)err, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
 static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 {
 	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -575,6 +639,9 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 	n += sprintf(buf + n, "%s", "\n");
 
 	AppendFaultLog(buf, (unsigned long)n);
+
+	// And a dump with the surrounding memory, which the engine's own does not carry.
+	WriteRichDump(ep);
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2609,6 +2676,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// Diagnostic: follow the allocator globals and the trampoline counters while the game runs.
 	// Separate this run from the previous ones in the fault log, and keep the engine log.
 	StartFaultSession(lpCmdLine);
+
+	// -dumptest writes one dump immediately, to prove the mechanism works on this machine
+	// rather than finding out it does not at the moment a crash finally happens.
+	if (lpCmdLine && strstr(lpCmdLine, "-dumptest")) WriteRichDump(NULL);
 
 	if (lpCmdLine && strstr(lpCmdLine, "-cbwatch")) g_cbWatch = true;
 
