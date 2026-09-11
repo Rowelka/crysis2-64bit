@@ -580,7 +580,7 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 		"r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"
 	};
 
-	char buf[2048];
+	char buf[6144];   // registers, ten stack frames, and a line per register pointer
 	int n = 0;
 	ULONG_PTR rva = 0;
 	const char* mod = ModuleAt((ULONG_PTR)c->Rip, &rva);
@@ -638,10 +638,32 @@ static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
 	}
 	n += sprintf(buf + n, "%s", "\n");
 
+	// What the registers point at. Two crashes in a row came down to an object whose table
+	// of methods held something that was not a table, and neither the engine's dump nor a
+	// dump written from inside the fault handler kept that memory - dbghelp faulted trying.
+	// Sixteen bytes read here, with the same guarded read used everywhere else, answers the
+	// question directly: an object still alive starts with a pointer into a module.
+	n += sprintf(buf + n, "  what the registers point at:%s", "\n");
+	for (int i = 0; i < 16; i++)
+	{
+		const ULONG_PTR v = regs[i];
+		if (v < 0x10000 || v >= 0x0000800000000000ull) continue;
+		ULONG_PTR first = 0;
+		if (!SafePeek((const void*)v, &first)) continue;
+		ULONG_PTR rva = 0;
+		const char* mod = ModuleAt(first, &rva);
+		n += sprintf(buf + n, "    [%s] 0x%016llX -> 0x%016llX %s%s", names[i],
+		             (unsigned long long)v, (unsigned long long)first,
+		             mod ? "" : "(not a module address)", "\n");
+		if (mod)
+			n += sprintf(buf + n, "        vtable of %s+0x%llX%s", mod,
+			             (unsigned long long)rva, "\n");
+	}
+
 	AppendFaultLog(buf, (unsigned long)n);
 
-	// And a dump with the surrounding memory, which the engine's own does not carry.
-	WriteRichDump(ep);
+	// The dbghelp dump is NOT written from here: on the CentralStation crash it faulted
+	// inside dbghelp and produced a zero-byte file. It stays available under -dumptest.
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
