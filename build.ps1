@@ -81,7 +81,10 @@ if (Test-Path $out) { Remove-Item $out -Force }
 # repository to source only. link /lib does the job - the WDK has no separate lib.exe.
 $csLib = Join-Path $dir "CrySystem.lib"
 if (-not (Test-Path $csLib)) {
-    & (Join-Path $Wdk "bin\x86\amd64\link.exe") /lib /nologo /def:(Join-Path $dir "CrySystem.def") /machine:x64 /out:$csLib
+    # Both paths go through variables: PowerShell splits "/def:(expression)" into two separate
+    # arguments, and link then reports a missing argument for the option that follows.
+    $csDef = Join-Path $dir "CrySystem.def"
+    & (Join-Path $Wdk "bin\x86\amd64\link.exe") /lib /nologo "/def:$csDef" /machine:x64 "/out:$csLib"
     if (-not (Test-Path $csLib)) { throw "failed to generate CrySystem.lib from CrySystem.def" }
 }
 
