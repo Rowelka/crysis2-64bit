@@ -38,6 +38,20 @@ Two flags exist if a fix causes trouble on your setup:
 |---|---|
 | `-noborderless` | leave the window alone, use whatever mode the game picks |
 | `-keepintro` | keep the intro videos and the debug overlay |
+| `-allowmultiple` | start a second copy without asking |
+
+There are also diagnostic flags. They are not needed for playing, but they turn "it crashes on
+your machine and not on mine" into something answerable:
+
+| Flag | Effect |
+|---|---|
+| `-traceallocs` | log every large engine allocation, its size and the address it got, to `launcher_faults.txt` |
+| `-forcehighheap` | reserve all free memory below the 4 GB line before engine init, forcing the heap above it |
+| `-enginefix` | apply the pointer-width correction described below (off by default) |
+
+`-forcehighheap` exists because pointer truncation only shows up when memory lands high, which on
+most machines it never does. The flag makes that condition happen on demand, so a fix can be
+tested in twenty seconds instead of by shipping a build and waiting for reports.
 
 ---
 
@@ -108,17 +122,33 @@ alone so it doesn't fight Alt-Tab. If the game ends up in exclusive fullscreen a
 is already borderless and full-screen, so the check finds nothing to do. Disable with
 `-noborderless`.
 
-### 3. The x64 heap truncation crash
+### 3. The truncated pointer in the engine's allocator
 
-Retail `CrySystem.dll` contains a bucket allocator that stores slab addresses **truncated to 32
-bits**. In a 64-bit process whose heap lands above the 4 GB line, those pointers are silently
-corrupted. The editor does not hit this because its primary CRT is `msvcr90`, which places the
-heap low.
+Retail `CrySystem.dll` keeps the head of its bucket allocator's free-page list in a global that
+every read treats as 64 bits wide and exactly one write treats as 32:
 
-The launcher reproduces that condition on purpose: it is built with the **VC90 compiler from WDK
-7.1** and links `msvcr90` as the primary CRT (`/MD`), so the process heap lands below 4 GB and the
-truncation becomes harmless. This is why `build.ps1` uses the WDK toolchain rather than a modern
-MSVC - it is load-bearing, not legacy.
+```
+RVA 0x0A16F1   read    64-bit
+RVA 0x0A1715   read    64-bit
+RVA 0x0A1A30   read    64-bit
+RVA 0x0A1A49   WRITE   32-bit      mov dword ptr [rip+0x6578E9], ebp
+```
+
+The top half of the pointer is dropped on the way in and reads back as zero. In the original
+32-bit game this was invisible, because addresses were 32 bits anyway. In a 64-bit process it
+stays invisible only while the allocation sits below the 4 GB line.
+
+The launcher keeps it that way: it is built with the **VC90 compiler from WDK 7.1** and links
+`msvcr90` as the primary CRT (`/MD`), so the process heap lands low - the same situation the
+editor is in, which is why the editor never hit this. That is why `build.ps1` uses the WDK
+toolchain rather than a modern MSVC; it is load-bearing, not nostalgia.
+
+A patch for the instruction itself exists (`-enginefix`): the store is one REX.W prefix short of
+being correct, and the dead register reload in front of it frees exactly the byte that prefix
+needs, so the fix is byte-for-byte the same length and no displacement moves. It is **off by
+default**, because it turns out not to be needed - startup survives `-forcehighheap`, which forces
+every allocation above the line, with the patch and without it. The engine is left alone unless
+there is a reason to touch it.
 
 ### 4. Level-load and cutscene crashes
 
@@ -178,7 +208,11 @@ the engine directly. At startup it:
 4. **Starts a background thread** that finds the game window and strips its frame, then keeps
    watching in case the engine recreates the window.
 5. **Writes `launcher_diag.txt`**, before engine init so the file survives a startup crash.
-6. **Creates the engine** through `CreateSystemInterface`, in the same order the editor uses.
+6. **Creates the engine** through `CreateSystemInterface`, in the same order the editor uses,
+   and hands the result to the game DLL through `SSystemInitParams::pSystem`. That hand-off is
+   not optional: the field is documented as "reused if not NULL", and without it the game brings
+   up a second `CSystem` on top of the first. The second one dies while allocating the pak heap
+   pools, which surfaces as `Failed CMTSafeHeap::m_pBigPool allocation` on startup.
 7. **Patches the loaded engine DLLs** in memory: the CryAction release asserts that force-crash
    on level load, the CryMovie update loop that walks freed entries after a layer unload, and two
    unimplemented vtable slots in the editor build of CrySystem.
@@ -193,6 +227,10 @@ Command line flags:
 |---|---|
 | `-noborderless` | leave the window alone, use whatever mode the game picks |
 | `-keepintro` | keep the intro videos and the debug overlay |
+| `-allowmultiple` | start a second copy without asking |
+| `-traceallocs` | log large engine allocations to `launcher_faults.txt` |
+| `-forcehighheap` | force the heap above the 4 GB line, to reproduce truncation on demand |
+| `-enginefix` | apply the pointer-width correction (off by default) |
 
 ## Building
 
@@ -201,15 +239,35 @@ You need:
 - **WDK 7.1** for the VC90 x64 compiler. This is not nostalgia: the launcher has to link against
   msvcr90 as its primary CRT so the process heap lands below the 4 GB line, or retail CrySystem's
   truncated slab pointers come back corrupt. See the heap section above.
+
+  Tested rather than assumed: the same source built with MSVC 14.51, both `/MD` and `/MT`, does
+  not start at all. The process hangs before `WinMain` reaches its first line - no `Game.log`, no
+  `launcher_diag.txt` - because `CrySystem` is imported statically and its static initialisers
+  allocate through the engine allocator while the wrong CRT is the primary one.
 - **Windows 10 SDK** for `rc.exe` and `mt.exe`, the resource compiler and manifest tool.
 - **An installed copy of the game**, because the build extracts cursor resources from its
   `Crysis2.exe`.
 
-Edit the paths at the top of `build.ps1` to match your install, then run it:
+Run it:
 
 ```powershell
 .\build.ps1
 ```
+
+The script finds the game by walking up from its own folder, looking for a `Bin64\CrySystem.dll`
+next to game content. If it guesses wrong, or the repository is cloned somewhere else entirely,
+name the install yourself:
+
+```powershell
+.\build.ps1 -GamePath "C:\Games\Crysis 2" -NoDeploy
+```
+
+| Parameter | Effect |
+|---|---|
+| `-GamePath` | the Crysis 2 install, the folder holding `Bin64` and `gamecrysis2` |
+| `-Wdk` | WDK 7.1 root, if it is not in `C:\WinDDK\7600.16385.1` |
+| `-Kit` | Windows SDK `bin\<version>\x64`, if the newest installed one is not wanted |
+| `-NoDeploy` | build only, do not copy the result into the game |
 
 The script generates `CrySystem.lib` from `CrySystem.def`, extracts the cursors, compiles the
 resource script, builds `Main_min.cpp`, embeds the VC90 CRT manifest, and copies the result into
@@ -219,20 +277,58 @@ Two files are deliberately absent from this repository and produced at build tim
 `CrySystem.lib`, which is derived from the game's own DLL, and the cursor `.cur` files, which are
 Crytek assets. Neither is ours to distribute.
 
+### Testing a build
+
+```powershell
+.\test.ps1 -Runs 3
+```
+
+It launches the game a few times and reports whether each run actually reached its menu. The
+verdict matters more than it sounds: a build can stop printing an error and still be broken, so
+"no error in the log" is not a pass. A run counts only if the renderer came up, the window is a
+real window rather than the 8x8 one a half-initialised renderer creates, no allocator failure was
+logged, and the process actually loaded content. Startup is not deterministic either, which is
+why the default is three runs rather than one.
+
 ## Known issues
 
 | Issue | Notes |
 |---|---|
-| Intro videos do not decode | Skipped by default; the decoder itself is unfixed. |
+| Intro videos render as white rectangles | Skipped by default. The decoder is present and is not the problem - see below. |
 | Co-op dialogue lines cut off and repeat | Not game-breaking. |
+| The engine reports 0 MB of video memory | Real, but no effect could be measured - see below. |
+
+**On the videos.** It is tempting to assume the 64-bit build has no video decoder. It has one:
+retail x64 `CrySystem.dll` carries a complete 64-bit CRI Sofdec build (`CRI Movie/PCx64 Ver.2.68`),
+together with its error strings - `Need to call CriMv::Initialize()`, `CRI Heap is not
+initialized`, `Decode USM header timeout`. So the white rectangles are something not being
+initialised rather than something not being there, and one of those messages should appear in
+`Game.log` when a video is actually requested. Worth a look if anyone wants the intro back.
+
+**On the video memory.** The renderer reports zero on a card with 12 GB, and follows it with
+"Disabling of textures streaming...". That message is printed unconditionally as part of
+reinitialising the texture manager - "Finished initializing textures streaming..." follows a few
+lines later - so it is not the disable it appears to be. The zero itself is real, but forcing the
+size check that depends on it, and setting `r_TexturesStreaming 1`, both change nothing
+observable.
 
 ## Diagnostics
 
 On every start the launcher writes `launcher_diag.txt` next to the game, before engine init, so
-the file exists even if the engine dies on startup. It records the launcher build, the command
-line, whether the timer fix and borderless mode actually applied, OS build, CPU thread count,
-RAM, desktop mode and refresh rate, GPU name, DPI scale, the size and date of every engine module,
-and the size of every game pak.
+the file exists even if the engine dies on startup. It records:
+
+- the launcher build and the command line it was given
+- whether each fix actually applied - the timer, borderless, the engine patch, the allocator trace
+- the install path, whether the game folder is writable, free disk space, and the system locale
+- OS build, CPU thread count, RAM, desktop mode and refresh rate, GPU name, DPI scale
+- how much address space is free below the 4 GB line, and the largest single free block in it
+- where the engine's allocator actually placed its first block, and whether a 14 MB request succeeds
+- the size and date of every engine module, and the size of every game pak
+
+The write-access and free-space lines exist because a read-only install or a full disk produces
+a failure that looks like a code bug. The address-space lines exist because this engine only
+works while its memory stays low, so knowing where it landed is the difference between a guess
+and an answer.
 
 The pak list matters more than it looks: bug reports that appear to be launcher problems often
 turn out to be differences between game copies (retail versus a repack with re-encoded or removed
@@ -249,7 +345,7 @@ information.
   addresses used here were taken from that project.
 
 This launcher's source is written from scratch (STL-free, so it can be compiled by the VC90
-toolchain); it is not a fork of either project. 
+toolchain); it is not a fork of either project.
 
 ## License
 
