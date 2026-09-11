@@ -18,6 +18,7 @@
 !README.md
 !LICENSE
 !build.ps1
+!test.ps1
 !extract_cursors.py
 !launcher.rc
 !resource.h
