@@ -402,6 +402,35 @@ static void AppendFaultLog(const char* text, unsigned long len)
 	AppendTextFile("launcher_faults.txt", text, len);
 }
 
+// Marks a new session in the fault log, and keeps the engine's log from the previous one.
+//
+// launcher_faults.txt is appended to, so faults from several play sessions pile up in one file
+// with nothing to separate them - and the engine rewrites Game.log on every start, which is the
+// only place that says which level was loading when a fault happened. Both are needed together
+// to make sense of a crash reported hours later.
+static void StartFaultSession(const char* cmdLine)
+{
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	// Keep the previous Game.log: the engine is about to overwrite it.
+	if (GetFileAttributesA("Game.log") != INVALID_FILE_ATTRIBUTES)
+	{
+		CreateDirectoryA("launcher_logs", NULL);
+		char kept[MAX_PATH];
+		sprintf(kept, "launcher_logs%cGame_%04u%02u%02u_%02u%02u%02u.log", 92,
+		        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+		MoveFileA("Game.log", kept);
+	}
+
+	char line[512];
+	int n = sprintf(line,
+	                "%s=== session %04u-%02u-%02u %02u:%02u:%02u  args: %s ===%s",
+	                "\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+	                (cmdLine && *cmdLine) ? cmdLine : "(none)", "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
 // Names the module an address belongs to, without pulling in psapi: the allocation base of a
 // mapped image is its module handle.
 static const char* ModuleAt(ULONG_PTR addr, ULONG_PTR* rvaOut)
@@ -2566,6 +2595,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	                GetCurrentProcess(), &g_mainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
 	// Diagnostic: follow the allocator globals and the trampoline counters while the game runs.
+	// Separate this run from the previous ones in the fault log, and keep the engine log.
+	StartFaultSession(lpCmdLine);
+
 	if (lpCmdLine && strstr(lpCmdLine, "-cbwatch")) g_cbWatch = true;
 
 	// Enlarge the renderer's constant-buffer cache before it is built.
