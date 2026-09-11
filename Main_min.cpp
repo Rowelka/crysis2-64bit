@@ -1616,6 +1616,7 @@ static SIZE_T           g_topDownMin   = 64 * 1024;   // below this it is not wo
 static volatile LONG    g_topDownCalls = 0;
 static volatile LONG    g_topDownHigh  = 0;           // how many landed above 4 GB
 static unsigned long long g_topDownHighest = 0;
+static volatile LONGLONG  g_highBytes     = 0;   // how much actually went high
 static unsigned long long g_topDownLowest  = ~0ull;
 
 static LPVOID WINAPI TopDownVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
@@ -1697,6 +1698,40 @@ static int HookTopDownEverywhere(void)
 
 static bool g_topDown = false;
 
+// Walks the whole address space and adds up what is committed, on each side of the 4 GB line.
+// This is the number that says whether the engine is really using 64-bit memory: the count of
+// intercepted reservations does not, because most of the game's memory arrives another way -
+// file mappings for the .pak archives, and driver allocations for textures.
+static void MemoryCensus(unsigned long long* lowMb, unsigned long long* highMb,
+                         unsigned long long* imageMb)
+{
+	unsigned long long low = 0, high = 0, image = 0;
+	MEMORY_BASIC_INFORMATION mbi;
+	unsigned long long at = 0x10000;
+
+	for (int guard = 0; guard < 500000; guard++)
+	{
+		if (!VirtualQuery((LPCVOID)(ULONG_PTR)at, &mbi, sizeof(mbi))) break;
+
+		const unsigned long long size = (unsigned long long)mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT)
+		{
+			if (mbi.Type == MEM_IMAGE) image += size;
+			else if (at >= 0x100000000ull) high += size;
+			else low += size;
+		}
+
+		const unsigned long long next = at + size;
+		if (next <= at) break;
+		at = next;
+		if (at >= 0x7FFFFFFF0000ull) break;
+	}
+
+	*lowMb = low / (1024 * 1024);
+	*highMb = high / (1024 * 1024);
+	*imageMb = image / (1024 * 1024);
+}
+
 // The same steering, one level down.
 //
 // Hooking VirtualAlloc through the import tables turned out to catch almost nothing: the engine
@@ -1727,16 +1762,18 @@ static volatile LONGLONG  g_highCursor  = 0x200000000LL;      // 8 GB, and climb
 //   dsound          - packs a pointer into 43 bits; not the game's code, and not ours to fix.
 //
 // Each name removed from this list is one subsystem that has become genuinely 64-bit.
-static const char* const kNotReadyYet[] = {
-	"CryScriptSystem.dll",
-	"dsound.dll",
-	"dsound",
-};
+//
+// Both entries are gone now: CryScriptSystem's compare-and-exchange has been widened, and
+// dsound only broke at the very top of the address space, which is no longer where memory goes.
+// The list stays because the next subsystem to be found will go in it while it is being fixed.
+static const char* const kNotReadyYet[] = { 0, 0, 0 };
 
 // Whether this allocation is being made on behalf of a module that is not ready. Reading the
 // stack costs something, but only large reservations get here - a few hundred over a whole run.
 static bool CalledByUnreadyModule(void)
 {
+	if (!kNotReadyYet[0] && !kNotReadyYet[1] && !kNotReadyYet[2]) return false;
+
 	void* frames[12];
 	const USHORT n = CaptureStackBackTrace(1, 12, frames, NULL);
 
@@ -1755,7 +1792,7 @@ static bool CalledByUnreadyModule(void)
 		for (const char* s = path; *s; s++) if (*s == 92 || *s == '/') name = s + 1;
 
 		for (int k = 0; k < 3; k++)
-			if (_stricmp(name, kNotReadyYet[k]) == 0) return true;
+			if (kNotReadyYet[k] && _stricmp(name, kNotReadyYet[k]) == 0) return true;
 	}
 	return false;
 }
@@ -1805,7 +1842,11 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 		{
 			const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
 			InterlockedIncrement(&g_topDownCalls);
-			if (a > 0xFFFFFFFFull) InterlockedIncrement(&g_topDownHigh);
+			if (a > 0xFFFFFFFFull)
+			{
+				InterlockedIncrement(&g_topDownHigh);
+				InterlockedExchangeAdd64(&g_highBytes, (LONGLONG)*size);
+			}
 			if (a > g_topDownHighest) g_topDownHighest = a;
 			if (a < g_topDownLowest)  g_topDownLowest  = a;
 			return st;
@@ -1909,8 +1950,8 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 			if (!saidHigh && g_topDownHigh > 0)
 			{
 				int m = sprintf(line, "  topdown: memory is landing high, %ld of %ld above 4 GB,"
-				                " top 0x%llX%s", g_topDownHigh, g_topDownCalls,
-				                g_topDownHighest, "\n");
+				                " %lld MB so far, top 0x%llX%s", g_topDownHigh, g_topDownCalls,
+				                g_highBytes / (1024 * 1024), g_topDownHighest, "\n");
 				AppendFaultLog(line, (unsigned long)m);
 				saidHigh = true;
 			}
@@ -1951,10 +1992,20 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		if (elapsed < nextReport) continue;
 		nextReport += 300;
 
+		{
+			unsigned long long lowMb = 0, highMb = 0, imageMb = 0;
+			MemoryCensus(&lowMb, &highMb, &imageMb);
+			const unsigned long long totalMb = lowMb + highMb;
+			int c = sprintf(line, "  memory: %llu MB low, %llu MB high (%llu%%), %llu MB modules%s",
+			                lowMb, highMb, totalMb ? (100 * highMb / totalMb) : 0, imageMb, "\n");
+			AppendFaultLog(line, (unsigned long)c);
+		}
+
 		if (g_topDown)
 		{
-			int m = sprintf(line, "  topdown: %ld steered, %ld above 4 GB, 0x%llX..0x%llX%s",
-			                g_topDownCalls, g_topDownHigh,
+			int m = sprintf(line, "  topdown: %ld steered, %ld above 4 GB (%lld MB), "
+			                "0x%llX..0x%llX%s",
+			                g_topDownCalls, g_topDownHigh, g_highBytes / (1024 * 1024),
 			                (g_topDownLowest == ~0ull) ? 0 : g_topDownLowest,
 			                g_topDownHighest, "\n");
 			AppendFaultLog(line, (unsigned long)m);
