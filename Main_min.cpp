@@ -1276,14 +1276,35 @@ static const unsigned char kAiExpect[] = {
 	0xFF, 0x50, 0x38               // call qword ptr [rax + 0x38]
 };
 
-static unsigned long long* g_aiCount   = 0; // how many ranges are filled in
-static unsigned long long* g_aiRanges  = 0; // pairs of (first byte, one past the last) per module
-static unsigned long long* g_aiRejects = 0; // candidates turned away; lives in the cave, so the
-                                            // trampoline can reach it with a 32-bit offset -
-                                            // a counter in the launcher is four gigabytes away.
+// A table of module ranges, and the two places that check a pointer against it.
+//
+// Both crashes that survived the memory work look the same from the inside: an object is
+// destroyed, a pointer to it stays on a list, and the engine calls a method through it. The
+// first field of a live object of that kind points into a loaded module; a destroyed one holds
+// whatever the allocator left there. That is the whole test.
+//
+// The first attempt kept a single lowest..highest span instead, which measured 0x1C470000 to
+// 0x7FFEEFD9A000 in a real run - a hundred and forty terabytes, with the whole heap inside it.
+// It would have passed every destroyed object straight through. Modules land where the system
+// puts them and they are not neighbours, so each one needs its own pair.
+//
+// Each patch site gets its own copy of the table, because the table has to sit within a 32-bit
+// offset of the trampoline that reads it, and the modules being patched are far apart.
+//
+// Layout of a table: count, rejected, the ranges, then the trampoline's code.
+#define MR_MAX_RANGES  1024
+#define MR_CAVE_SIZE   0x10000
+#define MR_MAX_TABLES  4
 
-#define AI_MAX_RANGES  1024
-#define AI_CAVE_SIZE   0x10000
+#define MR_COUNT(t)   ((unsigned long long*)((t) + 0))
+#define MR_REJECT(t)  ((unsigned long long*)((t) + 8))
+#define MR_ACCEPT(t)  ((unsigned long long*)((t) + 16))
+#define MR_RANGES(t)  ((unsigned long long*)((t) + 24))
+#define MR_CODE(t)    ((t) + 24 + MR_MAX_RANGES * 16)
+
+static unsigned char* g_mrTable[MR_MAX_TABLES];
+static const char*    g_mrName[MR_MAX_TABLES];
+static int            g_mrTables = 0;
 
 typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE*, DWORD, LPDWORD);
 static PFN_EnumProcessModules g_enumModules = 0;
@@ -1302,8 +1323,8 @@ static bool FindEnumModules(void)
 	return g_enumModules != 0;
 }
 
-// Whether a module is one of the engine's own. Those hold the tables the check is looking
-// for nearly every time, so they are listed first and the walk usually ends within a few steps.
+// Whether a module is one of the engine's own. Those hold the tables the checks are looking for
+// nearly every time, so they are listed first and the walk usually ends within a few steps.
 static bool IsEngineModule(HMODULE m)
 {
 	char path[MAX_PATH];
@@ -1312,7 +1333,8 @@ static bool IsEngineModule(HMODULE m)
 	const char* name = path;
 	for (const char* s = path; *s; s++) if (*s == 92 || *s == '/') name = s + 1;
 
-	return (name[0] == 'C' || name[0] == 'c') && name[1] == 'r' && name[2] == 'y';
+	if ((name[0] == 'C' || name[0] == 'c') && name[1] == 'r' && name[2] == 'y') return true;
+	return (name[0] == 'f' || name[0] == 'F') && name[1] == 'm' && name[2] == 'o' && name[3] == 'd';
 }
 
 // One past the last byte a module occupies, from its own header.
@@ -1326,20 +1348,15 @@ static unsigned long long ModuleEnd(HMODULE m)
 	return (unsigned long long)(ULONG_PTR)base + nt->OptionalHeader.SizeOfImage;
 }
 
-// Lists every module the process has mapped, adding the ones not listed yet.
+// Adds the modules a table does not list yet.
 //
-// The first attempt kept a single lowest..highest span instead, which measured 0x1C470000 to
-// 0x7FFEEFD9A000 in a real run - a hundred and forty terabytes, with the whole heap inside it.
-// It would have passed every destroyed object straight through. Modules land where the system
-// puts them and they are not neighbours, so each one needs its own pair.
-//
-// The list only grows and the count is raised last, so the trampoline reads it without locking:
+// The list only grows and the count is raised last, so a trampoline reads it without locking:
 // it either sees a new entry or does not see it yet, never half of one. A module that unloads
 // leaves its range behind, which at worst lets one stale pointer through - exactly what the game
-// does without this fix.
-static int AiSyncModuleRanges(void)
+// does without these fixes.
+static int SyncOneTable(unsigned char* table)
 {
-	if (!g_aiRanges || !FindEnumModules()) return 0;
+	if (!table || !FindEnumModules()) return 0;
 
 	HMODULE mods[512];
 	DWORD needed = 0;
@@ -1348,7 +1365,9 @@ static int AiSyncModuleRanges(void)
 	unsigned n = (unsigned)(needed / sizeof(HMODULE));
 	if (n > 512) n = 512;
 
+	unsigned long long* ranges = MR_RANGES(table);
 	int added = 0;
+
 	for (int pass = 0; pass < 2; pass++)
 	for (unsigned i = 0; i < n; i++)
 	{
@@ -1358,23 +1377,118 @@ static int AiSyncModuleRanges(void)
 		const unsigned long long hi = ModuleEnd(mods[i]);
 		if (!hi || hi <= lo) continue;
 
-		const unsigned long long have = *g_aiCount;
+		const unsigned long long have = *MR_COUNT(table);
 		unsigned long long k = 0;
-		for (; k < have; k++) if (g_aiRanges[k * 2] == lo) break;
+		for (; k < have; k++) if (ranges[k * 2] == lo) break;
 		if (k < have)
 		{
 			// Same base, bigger image: a module was replaced by a larger one.
-			if (hi > g_aiRanges[k * 2 + 1]) g_aiRanges[k * 2 + 1] = hi;
+			if (hi > ranges[k * 2 + 1]) ranges[k * 2 + 1] = hi;
 			continue;
 		}
-		if (have >= AI_MAX_RANGES) return added;
+		if (have >= MR_MAX_RANGES) return added;
 
-		g_aiRanges[have * 2 + 0] = lo;
-		g_aiRanges[have * 2 + 1] = hi;
-		InterlockedExchange64((LONGLONG volatile*)g_aiCount, (LONGLONG)(have + 1));
+		ranges[have * 2 + 0] = lo;
+		ranges[have * 2 + 1] = hi;
+		InterlockedExchange64((LONGLONG volatile*)MR_COUNT(table), (LONGLONG)(have + 1));
 		added++;
 	}
 	return added;
+}
+
+static int SyncModuleRanges(void)
+{
+	int added = 0;
+	for (int i = 0; i < g_mrTables; i++) added += SyncOneTable(g_mrTable[i]);
+	return added;
+}
+
+// A cave near 'anchor', with the module list already in it.
+static unsigned char* NewRangeTable(void* anchor, const char* name)
+{
+	if (g_mrTables >= MR_MAX_TABLES || !FindEnumModules()) return 0;
+
+	unsigned char* cave = AllocCaveNear(anchor, MR_CAVE_SIZE);
+	if (!cave) return 0;
+
+	*MR_COUNT(cave)  = 0;
+	*MR_REJECT(cave) = 0;
+	*MR_ACCEPT(cave) = 0;
+	if (SyncOneTable(cave) <= 0) return 0;
+
+	g_mrName[g_mrTables] = name;
+	g_mrTable[g_mrTables++] = cave;
+	return cave;
+}
+
+// Emits the walk over a table. Falls through when the value is inside some module, and the two
+// returned offsets are the jumps to fill in: the first goes to the "not in a module" path, the
+// second to the "in a module" path.
+//
+// Two register layouts, because the two sites have different registers to spare. Everything used
+// is scratch by the calling convention and the flags are dead at both sites, so nothing the
+// engine is holding gets disturbed.
+//   layout 0: value in rax, cursor r10, counter r11   (the AI site)
+//   layout 1: value in r10, cursor rax, counter r11   (the sound site, where r10 is the call)
+static int EmitRangeWalk(unsigned char* code, int n, const unsigned char* table,
+                         int layout, int* fixEmpty, int* fixInside)
+{
+	if (layout == 0) { code[n++] = 0x4C; code[n++] = 0x8D; code[n++] = 0x15; } // lea r10, [rip+..]
+	else             { code[n++] = 0x48; code[n++] = 0x8D; code[n++] = 0x05; } // lea rax, [rip+..]
+	{
+		const long rel = (long)((const unsigned char*)MR_RANGES(table) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+	code[n++] = 0x4C; code[n++] = 0x8B; code[n++] = 0x1D;            // mov r11, [rip + count]
+	{
+		const long rel = (long)((const unsigned char*)MR_COUNT(table) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+
+	const int top = n;
+	code[n++] = 0x4D; code[n++] = 0x85; code[n++] = 0xDB;            // test r11, r11
+	code[n++] = 0x74; *fixEmpty = n; code[n++] = 0x00;               // jz  not-in-a-module
+
+	if (layout == 0)
+	{
+		code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x02;        // cmp rax, [r10]
+		code[n++] = 0x72; const int below = n; code[n++] = 0x00;     // jb  next
+		code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x42; code[n++] = 0x08; // cmp rax, [r10+8]
+		code[n++] = 0x72; *fixInside = n; code[n++] = 0x00;          // jb  in-a-module
+		code[below] = (unsigned char)(n - (below + 1));
+		code[n++] = 0x49; code[n++] = 0x83; code[n++] = 0xC2; code[n++] = 0x10; // add r10, 16
+	}
+	else
+	{
+		code[n++] = 0x4C; code[n++] = 0x3B; code[n++] = 0x10;        // cmp r10, [rax]
+		code[n++] = 0x72; const int below = n; code[n++] = 0x00;     // jb  next
+		code[n++] = 0x4C; code[n++] = 0x3B; code[n++] = 0x50; code[n++] = 0x08; // cmp r10, [rax+8]
+		code[n++] = 0x72; *fixInside = n; code[n++] = 0x00;          // jb  in-a-module
+		code[below] = (unsigned char)(n - (below + 1));
+		code[n++] = 0x48; code[n++] = 0x83; code[n++] = 0xC0; code[n++] = 0x10; // add rax, 16
+	}
+
+	code[n++] = 0x49; code[n++] = 0xFF; code[n++] = 0xCB;            // dec r11
+	code[n++] = 0xEB;
+	code[n] = (unsigned char)(top - (n + 1)); n++;                   // jmp top
+	return n;
+}
+
+// inc qword ptr [rip + counter]
+static int EmitInc(unsigned char* code, int n, const unsigned long long* counter)
+{
+	code[n++] = 0x48; code[n++] = 0xFF; code[n++] = 0x05;
+	const long rel = (long)((const unsigned char*)counter - (code + n + 4));
+	memcpy(code + n, &rel, 4); n += 4;
+	return n;
+}
+
+static int EmitJump(unsigned char* code, int n, const unsigned char* target)
+{
+	code[n++] = 0xE9;
+	const long rel = (long)(target - (code + n + 4));
+	memcpy(code + n, &rel, 4); n += 4;
+	return n;
 }
 
 static const char* PatchAiDeadTarget(void)
@@ -1384,131 +1498,208 @@ static const char* PatchAiDeadTarget(void)
 
 	unsigned char* at = ai + AI_TARGET_CALL_RVA;
 	if (memcmp(at, kAiExpect, sizeof(kAiExpect)) != 0) return "no match";
-	if (!FindEnumModules()) return "no way to list modules";
 
-	unsigned char* cave = AllocCaveNear(ai, AI_CAVE_SIZE);
-	if (!cave) return "no cave";
+	unsigned char* table = NewRangeTable(ai, "aifix");
+	if (!table) return "no cave";
 
-	// Layout: count, rejected, the ranges, then the code - all within reach of a rip-relative
-	// offset from the trampoline.
-	g_aiCount   = (unsigned long long*)(cave + 0);
-	g_aiRejects = (unsigned long long*)(cave + 8);
-	g_aiRanges  = (unsigned long long*)(cave + 16);
-	*g_aiCount   = 0;
-	*g_aiRejects = 0;
-
-	if (AiSyncModuleRanges() <= 0) return "could not list modules";
-
-	unsigned char* code = cave + 16 + AI_MAX_RANGES * 16;
-	int n = 0;
+	unsigned char* code = MR_CODE(table);
+	int n = 0, fixEmpty = 0, fixInside = 0;
 
 	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x02;            // mov rax, [rdx]
+	n = EmitRangeWalk(code, n, table, 0, &fixEmpty, &fixInside);
 
-	code[n++] = 0x4C; code[n++] = 0x8D; code[n++] = 0x15;            // lea r10, [rip + ranges]
-	{
-		const long rel = (long)((unsigned char*)g_aiRanges - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
-	code[n++] = 0x4C; code[n++] = 0x8B; code[n++] = 0x1D;            // mov r11, [rip + count]
-	{
-		const long rel = (long)((unsigned char*)g_aiCount - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
+	// Not in a module: count it and take the engine's own "no target" exit.
+	code[fixEmpty] = (unsigned char)(n - (fixEmpty + 1));
+	n = EmitInc(code, n, MR_REJECT(table));
+	n = EmitJump(code, n, ai + AI_TARGET_FAIL_RVA);
 
-	// Walk the ranges. r10 and r11 are scratch by the calling convention, and the flags are
-	// dead here, so nothing the engine is holding gets disturbed.
-	const int top = n;
-	code[n++] = 0x4D; code[n++] = 0x85; code[n++] = 0xDB;            // test r11, r11
-	code[n++] = 0x74; const int fixEmpty = n; code[n++] = 0x00;      // jz  bad
-
-	code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x02;            // cmp rax, [r10]
-	code[n++] = 0x72; const int fixBelow = n; code[n++] = 0x00;      // jb  next
-
-	code[n++] = 0x49; code[n++] = 0x3B; code[n++] = 0x42; code[n++] = 0x08;  // cmp rax, [r10+8]
-	code[n++] = 0x72; const int fixInside = n; code[n++] = 0x00;     // jb  good
-
-	const int next = n;
-	code[fixBelow] = (unsigned char)(next - (fixBelow + 1));
-	code[n++] = 0x49; code[n++] = 0x83; code[n++] = 0xC2; code[n++] = 0x10; // add r10, 16
-	code[n++] = 0x49; code[n++] = 0xFF; code[n++] = 0xCB;            // dec r11
-	code[n++] = 0xEB;
-	code[n] = (unsigned char)(top - (n + 1)); n++;                   // jmp top
-
-	// Good: do exactly what the overwritten bytes did, then go back.
-	const int good = n;
-	code[fixInside] = (unsigned char)(good - (fixInside + 1));
+	// In a module: do exactly what the overwritten bytes did, then go back.
+	code[fixInside] = (unsigned char)(n - (fixInside + 1));
+	n = EmitInc(code, n, MR_ACCEPT(table));
 	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCA;            // mov rcx, rdx
 	code[n++] = 0xFF; code[n++] = 0x50; code[n++] = 0x38;            // call [rax + 0x38]
-	code[n++] = 0xE9;
-	{
-		const long rel = (long)((ai + AI_TARGET_BACK_RVA) - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
-
-	// Bad: count it and take the engine's own "no target" exit.
-	const int bad = n;
-	code[fixEmpty] = (unsigned char)(bad - (fixEmpty + 1));
-
-	code[n++] = 0x48; code[n++] = 0xFF; code[n++] = 0x05;            // inc qword ptr [rip+rel32]
-	{
-		const long rel = (long)((unsigned char*)g_aiRejects - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
-	code[n++] = 0xE9;
-	{
-		const long rel = (long)((ai + AI_TARGET_FAIL_RVA) - (code + n + 4));
-		memcpy(code + n, &rel, 4); n += 4;
-	}
+	n = EmitJump(code, n, ai + AI_TARGET_BACK_RVA);
 
 	if (!WriteJump(at, code, sizeof(kAiExpect))) return "jump failed";
 
 	static char result[160];
-	sprintf(result, "applied (%llu modules listed)", *g_aiCount);
+	sprintf(result, "applied (%llu modules listed)", *MR_COUNT(table));
 	return result;
 }
 
-// Applies the AI fix once CryAISystem is mapped, which happens well after the launcher starts.
-static DWORD WINAPI AiFixThread(LPVOID)
+// Stops the sound engine from calling a method on an object that no longer exists.
+//
+// The finale cutscene killed the game here, with the level finished and the video about to play:
+//
+//   0x05AEFE  mov r10, [rcx]           ; the object's table of methods
+//   0x05AF0A  mov [rsp+0x20], rax      ; fifth argument
+//   0x05AF0F  call [r10 + 0x50]        ; died here
+//
+// The object was at 0x0B654518 and its first field held 0x0B654500 - a heap address eighteen
+// bytes below itself, with text where the addresses of functions belong ("_flap" in the bytes).
+// The call went to a non-canonical address, which is why the report says 0xFFFFFFFFFFFFFFFF.
+// Two lines earlier the log says why: the cutscene's soundbank was "still queued for preload"
+// and "Create sound ... failed! Invalid platform sound" - the sound was never made, and
+// something kept using it anyway.
+//
+// When the check fails, return 0x38 - the value this same function returns two branches up when
+// it does not like the object it was given. The caller already handles sound errors; the log is
+// full of them. So the cutscene's audio goes quiet instead of taking the game down.
+#define SND_CALL_RVA 0x05AF0A
+#define SND_BACK_RVA 0x05AF13      // the instruction after the call
+
+static const unsigned char kSndExpect[] = {
+	0x48, 0x89, 0x44, 0x24, 0x20,  // mov qword ptr [rsp + 0x20], rax
+	0x41, 0xFF, 0x52, 0x50         // call qword ptr [r10 + 0x50]
+};
+
+static const char* PatchSoundDeadObject(void)
+{
+	unsigned char* fm = (unsigned char*)GetModuleHandleA("fmodex64.dll");
+	if (!fm) return "fmodex64 not loaded";
+
+	unsigned char* at = fm + SND_CALL_RVA;
+	if (memcmp(at, kSndExpect, sizeof(kSndExpect)) != 0) return "no match";
+
+	unsigned char* table = NewRangeTable(fm, "sndfix");
+	if (!table) return "no cave";
+
+	unsigned char* code = MR_CODE(table);
+	int n = 0, fixEmpty = 0, fixInside = 0;
+
+	code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x44;            // mov [rsp+0x20], rax
+	code[n++] = 0x24; code[n++] = 0x20;                              //   (frees rax for the walk)
+	n = EmitRangeWalk(code, n, table, 1, &fixEmpty, &fixInside);
+
+	// Not in a module: count it and return the error this function returns on its own.
+	code[fixEmpty] = (unsigned char)(n - (fixEmpty + 1));
+	n = EmitInc(code, n, MR_REJECT(table));
+	code[n++] = 0xB8; code[n++] = 0x38; code[n++] = 0x00;            // mov eax, 0x38
+	code[n++] = 0x00; code[n++] = 0x00;
+	n = EmitJump(code, n, fm + SND_BACK_RVA);
+
+	// In a module: make the call the overwritten bytes made, then go back.
+	code[fixInside] = (unsigned char)(n - (fixInside + 1));
+	n = EmitInc(code, n, MR_ACCEPT(table));
+	code[n++] = 0x41; code[n++] = 0xFF; code[n++] = 0x52; code[n++] = 0x50;  // call [r10 + 0x50]
+	n = EmitJump(code, n, fm + SND_BACK_RVA);
+
+	if (!WriteJump(at, code, sizeof(kSndExpect))) return "jump failed";
+
+	static char result[160];
+	sprintf(result, "applied (%llu modules listed)", *MR_COUNT(table));
+	return result;
+}
+
+// Keeps every table current, and says what the checks turned away.
+//
+// Modules map long after the first patch goes in - CryGameReal among them - and a module missing
+// from a table means live objects judged dead, which would leave the AI blind or the game silent.
+// Appending is two stores the trampolines pick up on their next call.
+static DWORD WINAPI RangeKeeperThread(LPVOID)
+{
+	unsigned long long seen[MR_MAX_TABLES];
+	bool               live[MR_MAX_TABLES];
+	for (int i = 0; i < MR_MAX_TABLES; i++) { seen[i] = 0; live[i] = false; }
+
+	char line[224];
+	unsigned elapsed = 0, nextReport = 300;
+	for (int i = 0; ; i++)
+	{
+		const unsigned step = (i < 60) ? 1 : 5;
+		Sleep(step * 1000);
+		elapsed += step;
+
+		const int added = SyncModuleRanges();
+		if (added > 0 && g_mrTables > 0)
+		{
+			int m = sprintf(line, "  ranges: %d module(s) more, %llu listed%s",
+			                added, *MR_COUNT(g_mrTable[0]), "\n");
+			AppendFaultLog(line, (unsigned long)m);
+		}
+
+		// Say when a check actually turned something away. Nothing here means the fix is sitting
+		// idle; a steady climb would mean it is rejecting live objects instead.
+		for (int k = 0; k < g_mrTables; k++)
+		{
+			// Once: proof the patched instruction is being executed at all. A quiet log means
+			// nothing until this line appears.
+			if (!live[k] && *MR_ACCEPT(g_mrTable[k]) > 0)
+			{
+				int m = sprintf(line, "  %s: check is live, %llu call(s) so far%s",
+				                g_mrName[k], *MR_ACCEPT(g_mrTable[k]), "\n");
+				AppendFaultLog(line, (unsigned long)m);
+				live[k] = true;
+			}
+
+			const unsigned long long rej = *MR_REJECT(g_mrTable[k]);
+			if (rej == seen[k]) continue;
+			int m = sprintf(line, "  %s: %llu dead object(s) turned away%s",
+			                g_mrName[k], rej, "\n");
+			AppendFaultLog(line, (unsigned long)m);
+			seen[k] = rej;
+		}
+
+		// Every five minutes, what each check has actually seen. A play session that ends in a
+		// crash still leaves the last of these in the log.
+		if (elapsed < nextReport) continue;
+		nextReport += 300;
+		for (int k = 0; k < g_mrTables; k++)
+		{
+			const unsigned long long ok = *MR_ACCEPT(g_mrTable[k]);
+			if (!ok) continue;
+			int m = sprintf(line, "  %s: %llu checked, %llu turned away, %u min in%s",
+			                g_mrName[k], ok, *MR_REJECT(g_mrTable[k]), elapsed / 60, "\n");
+			AppendFaultLog(line, (unsigned long)m);
+		}
+	}
+}
+
+static volatile LONG g_keeperStarted = 0;
+
+static void StartRangeKeeper(void)
+{
+	if (InterlockedCompareExchange(&g_keeperStarted, 1, 0) != 0) return;
+	DWORD tid = 0;
+	HANDLE th = CreateThread(NULL, 0, RangeKeeperThread, NULL, 0, &tid);
+	if (th) CloseHandle(th);
+}
+
+// Waits for a module to be mapped, which happens well after the launcher starts.
+static bool WaitForModule(const char* name)
 {
 	for (int i = 0; i < 12000; i++)
 	{
-		if (GetModuleHandleA("CryAISystem.dll")) break;
+		if (GetModuleHandleA(name)) { Sleep(50); return true; }  // let the loader finish with it
 		Sleep(5);
 	}
-	Sleep(50);   // let the loader finish with it
+	return false;
+}
+
+static DWORD WINAPI AiFixThread(LPVOID)
+{
+	WaitForModule("CryAISystem.dll");
 
 	const char* r = PatchAiDeadTarget();
 	char line[224];
 	int n = sprintf(line, "  aifix: dead-target check %s%s", r, "\n");
 	AppendFaultLog(line, (unsigned long)n);
 
-	// Keep the list current. Modules map long after CryAISystem - CryGameReal among them - and a
-	// module missing from the list means live objects judged dead, which would leave the AI blind.
-	// Appending is two stores the trampoline picks up on its next call.
-	if (!g_aiRanges) return 0;
-	unsigned long long seen = 0;
-	for (int i = 0; ; i++)
-	{
-		Sleep(i < 60 ? 1000 : 5000);
+	if (g_mrTables > 0) StartRangeKeeper();
+	return 0;
+}
 
-		const int added = AiSyncModuleRanges();
-		if (added > 0)
-		{
-			int m = sprintf(line, "  aifix: %d module(s) more, %llu listed%s",
-			                added, *g_aiCount, "\n");
-			AppendFaultLog(line, (unsigned long)m);
-		}
+static DWORD WINAPI SoundFixThread(LPVOID)
+{
+	WaitForModule("fmodex64.dll");
 
-		// Say when the check actually turned something away. Nothing here means the fix is
-		// sitting idle, and a steady climb would mean it is rejecting live objects instead.
-		const unsigned long long rej = *g_aiRejects;
-		if (rej != seen)
-		{
-			int m = sprintf(line, "  aifix: %llu dead target(s) turned away%s", rej, "\n");
-			AppendFaultLog(line, (unsigned long)m);
-			seen = rej;
-		}
-	}
+	const char* r = PatchSoundDeadObject();
+	char line[224];
+	int n = sprintf(line, "  sndfix: dead-object check %s%s", r, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	if (g_mrTables > 0) StartRangeKeeper();
+	return 0;
 }
 
 // Which corrections to apply, one bit per site: -enginefix turns on all eight,
@@ -2975,6 +3166,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, AiFixThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
+
+	if (lpCmdLine && strstr(lpCmdLine, "-sndfix"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, SoundFixThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
 
