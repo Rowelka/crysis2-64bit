@@ -57,6 +57,7 @@ the folder it looked in. If you get one of these boxes:
 | The 64-bit engine (CrySystem.dll) was not found | `launcher64.exe` is not in `Bin64`, or the Mod SDK was never installed. Check the folder layout above. |
 | CrySystem.dll does not export CreateSystemInterface | The engine files are from a different game or SDK. Reinstall the Crysis 2 Mod SDK. |
 | The engine failed to start up | Send `Game.log` and `launcher_diag.txt` (both in the Crysis 2 folder) with a bug report. |
+| "the side-by-side configuration is incorrect" | Windows cannot find the 2008 C runtime. Install the **Visual C++ 2008 x64 Redistributable**. This is rare: the launcher asks for `Microsoft.VC90.CRT 9.0.21022.8 (amd64)`, the same assembly the SDK's own `Editor.exe` and `CrySystem.dll` ask for, so a working Mod SDK install normally already has it. |
 
 Every launch writes `launcher_diag.txt` into the game folder, listing your hardware, display mode,
 and the versions of every engine module and pak. Attach that file to a bug report; it usually
@@ -333,9 +334,14 @@ why the default is three runs rather than one.
 **On the videos.** It is tempting to assume the 64-bit build has no video decoder. It has one:
 retail x64 `CrySystem.dll` carries a complete 64-bit CRI Sofdec build (`CRI Movie/PCx64 Ver.2.68`),
 together with its error strings - `Need to call CriMv::Initialize()`, `CRI Heap is not
-initialized`, `Decode USM header timeout`. So the white rectangles are something not being
-initialised rather than something not being there, and one of those messages should appear in
-`Game.log` when a video is actually requested. Worth a look if anyone wants the intro back.
+initialized`, `Decode USM header timeout`.
+
+More than that, the decoder demonstrably runs. Playing the in-level cutscene on Battery Park
+logs `PlayVideo`, then `Disable scene rendering for playback of FMV sequence`, then
+`re-enable scene rendering` exactly 71 seconds later - the length of the file - and not one CRI
+error in between. Reproduced three times. So whatever is wrong with the intro logos is in
+getting a decoded frame onto the screen, not in decoding it, which is a different place to look
+than the one this section used to point at.
 
 **On the video memory.** The renderer reports zero on a card with 12 GB, and follows it with
 "Disabling of textures streaming...". That message is printed unconditionally as part of
