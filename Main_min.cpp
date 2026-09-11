@@ -1245,6 +1245,186 @@ static size_t EmitHitCounter(unsigned char* buf, unsigned char* liveAddr, unsign
 	return n;
 }
 
+// Stops the AI from calling a method on an object that no longer exists.
+//
+// CAIActor::CanAcquireTarget (CryAISystem RVA 0x1606AC) is handed a candidate target, checks it
+// against null, and then calls through its table of methods:
+//
+//   0x1606C8  cmp rdx, rdi          ; candidate == null?
+//   0x1606CB  je  0x160878          ; yes - return "not a target"
+//   0x1606D1  mov rax, [rdx]        ; table of methods
+//   0x1606D4  mov rcx, rdx
+//   0x1606D7  call [rax + 0x38]
+//
+// Twice in a row the game died here with a candidate that was not null but was destroyed: its
+// first field held a heap address where a table of methods belongs, so the call went to an
+// address that was never code. It happens with the launcher's own corrections turned off too,
+// so this is the game's own bug - an entity removed while its pointer stayed on a list the AI
+// still walks.
+//
+// The fix reuses the engine's own answer. A live object of this kind starts with a pointer into
+// a loaded module; a destroyed one does not. When the check fails, jump to 0x160878 - the exact
+// place the function goes when the candidate is null - and the AI simply treats it as no target.
+// Nothing else changes, and a real object takes the original path untouched.
+#define AI_TARGET_CALL_RVA 0x1606D1
+#define AI_TARGET_BACK_RVA 0x1606DA      // the instruction after the call
+#define AI_TARGET_FAIL_RVA 0x160878      // xor al, al; restore; ret
+
+static const unsigned char kAiExpect[] = {
+	0x48, 0x8B, 0x02,              // mov rax, qword ptr [rdx]
+	0x48, 0x8B, 0xCA,              // mov rcx, rdx
+	0xFF, 0x50, 0x38               // call qword ptr [rax + 0x38]
+};
+
+static unsigned long long  g_aiModLo = 0;   // lowest byte of any engine module
+static unsigned long long  g_aiModHi = 0;   // one past the highest
+static unsigned long long* g_aiBounds  = 0; // the two bounds, as the trampoline reads them
+static unsigned long long* g_aiRejects = 0; // candidates turned away; lives in the cave, so the
+                                            // trampoline can reach it with a 32-bit offset -
+                                            // a counter in the launcher is four gigabytes away.
+
+// The span the engine's own modules occupy. A table of methods lives inside one of them; the
+// heap does not. Computed rather than assumed, because module addresses differ between machines.
+static void MeasureEngineModules(void)
+{
+	static const char* const kMods[] = {
+		"CrySystem.dll", "CryAction.dll", "CryAISystem.dll", "CryEntitySystem.dll",
+		"CryAnimation.dll", "Cry3DEngine.dll", "CryPhysics.dll", "CryScriptSystem.dll",
+		"CryRenderD3D11.dll", "CryNetwork.dll", "CryMovie.dll", "CryFont.dll",
+		"CryInput.dll", "CrySoundSystem.dll", "CryGameReal.dll", "CryGameCrysis2.dll",
+	};
+	for (int i = 0; i < 16; i++)
+	{
+		HMODULE m = GetModuleHandleA(kMods[i]);
+		if (!m) continue;
+
+		MEMORY_BASIC_INFORMATION mbi;
+		if (!VirtualQuery((LPCVOID)m, &mbi, sizeof(mbi))) continue;
+
+		const unsigned long long lo = (unsigned long long)(ULONG_PTR)m;
+		// Walk the image's regions to find where it ends.
+		unsigned long long hi = lo;
+		for (int guard = 0; guard < 64; guard++)
+		{
+			if (!VirtualQuery((LPCVOID)(ULONG_PTR)hi, &mbi, sizeof(mbi))) break;
+			if (mbi.AllocationBase != (LPVOID)(ULONG_PTR)lo) break;
+			hi = (unsigned long long)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+		}
+		if (!g_aiModLo || lo < g_aiModLo) g_aiModLo = lo;
+		if (hi > g_aiModHi) g_aiModHi = hi;
+	}
+}
+
+static const char* PatchAiDeadTarget(void)
+{
+	unsigned char* ai = (unsigned char*)GetModuleHandleA("CryAISystem.dll");
+	if (!ai) return "CryAISystem not loaded";
+
+	unsigned char* at = ai + AI_TARGET_CALL_RVA;
+	if (memcmp(at, kAiExpect, sizeof(kAiExpect)) != 0) return "no match";
+
+	MeasureEngineModules();
+	if (!g_aiModLo || g_aiModHi <= g_aiModLo) return "could not measure modules";
+
+	unsigned char* cave = AllocCaveNear(ai);
+	if (!cave) return "no cave";
+
+	// Layout: bounds, counter, then code - all within reach of a rip-relative offset.
+	memcpy(cave + 0, &g_aiModLo, 8);
+	memcpy(cave + 8, &g_aiModHi, 8);
+	g_aiBounds  = (unsigned long long*)(cave + 0);
+	g_aiRejects = (unsigned long long*)(cave + 16);
+	*g_aiRejects = 0;
+	unsigned char* code = cave + 24;
+	int n = 0;
+
+	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x02;            // mov rax, [rdx]
+
+	// cmp rax, [rip + (cave+0 - next)]
+	code[n++] = 0x48; code[n++] = 0x3B; code[n++] = 0x05;
+	{
+		const long rel = (long)((cave + 0) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+	code[n++] = 0x72; const int fixLo = n; code[n++] = 0x00;         // jb  bad
+
+	code[n++] = 0x48; code[n++] = 0x3B; code[n++] = 0x05;            // cmp rax, [rip + hi]
+	{
+		const long rel = (long)((cave + 8) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+	code[n++] = 0x73; const int fixHi = n; code[n++] = 0x00;         // jae bad
+
+	// Good: do exactly what the overwritten bytes did, then go back.
+	code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCA;            // mov rcx, rdx
+	code[n++] = 0xFF; code[n++] = 0x50; code[n++] = 0x38;            // call [rax + 0x38]
+	code[n++] = 0xE9;
+	{
+		const long rel = (long)((ai + AI_TARGET_BACK_RVA) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+
+	// Bad: count it and take the engine's own "no target" exit.
+	const int bad = n;
+	code[fixLo] = (unsigned char)(bad - (fixLo + 1));
+	code[fixHi] = (unsigned char)(bad - (fixHi + 1));
+
+	code[n++] = 0x48; code[n++] = 0xFF; code[n++] = 0x05;            // inc qword ptr [rip+rel32]
+	{
+		const long rel = (long)((unsigned char*)g_aiRejects - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+	code[n++] = 0xE9;
+	{
+		const long rel = (long)((ai + AI_TARGET_FAIL_RVA) - (code + n + 4));
+		memcpy(code + n, &rel, 4); n += 4;
+	}
+
+	if (!WriteJump(at, code, sizeof(kAiExpect))) return "jump failed";
+
+	static char result[160];
+	sprintf(result, "applied (modules 0x%llX..0x%llX)", g_aiModLo, g_aiModHi);
+	return result;
+}
+
+// Applies the AI fix once CryAISystem is mapped, which happens well after the launcher starts.
+static DWORD WINAPI AiFixThread(LPVOID)
+{
+	for (int i = 0; i < 12000; i++)
+	{
+		if (GetModuleHandleA("CryAISystem.dll")) break;
+		Sleep(5);
+	}
+	Sleep(50);   // let the loader finish with it
+
+	const char* r = PatchAiDeadTarget();
+	char line[224];
+	int n = sprintf(line, "  aifix: dead-target check %s%s", r, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	// Keep measuring. CryGameReal maps well after CryAISystem and sits far below it, so a
+	// range taken once is too narrow - and too narrow here means live objects judged dead,
+	// and an AI that stops seeing anything at all. The bounds are plain data in the cave, so
+	// widening them is two stores that the trampoline picks up on its next call.
+	if (!g_aiBounds) return 0;
+	unsigned long long lo = g_aiModLo, hi = g_aiModHi;
+	for (int i = 0; i < 120; i++)
+	{
+		Sleep(1000);
+		g_aiModLo = 0; g_aiModHi = 0;
+		MeasureEngineModules();
+		if (!g_aiModLo || g_aiModHi <= g_aiModLo) continue;
+		if (g_aiModLo >= lo && g_aiModHi <= hi) continue;
+		if (g_aiModLo < lo) lo = g_aiModLo;
+		if (g_aiModHi > hi) hi = g_aiModHi;
+		g_aiBounds[0] = lo;
+		g_aiBounds[1] = hi;
+		int m = sprintf(line, "  aifix: range widened to 0x%llX..0x%llX%s", lo, hi, "\n");
+		AppendFaultLog(line, (unsigned long)m);
+	}
+	return 0;
+}
+
 // Which corrections to apply, one bit per site: -enginefix turns on all eight,
 // -enginefix:1F only sites 1 to 5, -enginefix:20 only site 6, and so on.
 //
@@ -2702,6 +2882,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// -dumptest writes one dump immediately, to prove the mechanism works on this machine
 	// rather than finding out it does not at the moment a crash finally happens.
 	if (lpCmdLine && strstr(lpCmdLine, "-dumptest")) WriteRichDump(NULL);
+
+	// Guard the AI against calling into a destroyed target. Behind a flag until it has been
+	// played with: it changes engine behaviour, unlike the corrections, which restore it.
+	if (lpCmdLine && strstr(lpCmdLine, "-aifix"))
+	{
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, AiFixThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
 
 	if (lpCmdLine && strstr(lpCmdLine, "-cbwatch")) g_cbWatch = true;
 
