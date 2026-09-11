@@ -1923,7 +1923,7 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 	for (int i = 0; i < MR_MAX_TABLES; i++) { seen[i] = 0; live[i] = false; }
 
 	char line[224];
-	unsigned elapsed = 0, nextReport = 300;
+	unsigned elapsed = 0, nextReport = 60;   // first summary after a minute, then every five
 	for (int i = 0; ; i++)
 	{
 		const unsigned step = (i < 60) ? 1 : 5;

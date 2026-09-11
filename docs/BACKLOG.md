@@ -98,21 +98,43 @@ happens. A silent refusal. Next step is tracing the creation path rather than gu
 
 ### Does the pointer truncation actually matter
 
-The engine's allocator stores one pointer with a 32-bit write while every read of it is 64-bit.
-The bug is real and the site is known. What is **not** established is whether it ever bites.
+**Answered, 12.09.2026: yes, and there was far more of it than one site.**
 
-Measured so far: with `-forcehighheap`, which forces the heap above the 4 GB line where the
-truncated value becomes garbage, the game loads, the level builds, and entities spawn - 2315
-against 2311 in a normal run, which is noise. One run out of two died after four minutes with
-`Runaway thread` and no access violation recorded.
+The old criterion here was "the game runs for hours under `-forcehighheap` exactly as it does
+without it". That flag could never settle it - it reserves all the low address space, which
+breaks the renderer whether the pointers are correct or not.
 
-So the honest position is that the site looks dangerous and has not been shown to do damage.
-Fixing something whose harm is unproven is how `-enginefix` happened, and that flag now sits
-switched off because it breaks more than it helps.
+`-topdown` settles it instead. It hooks `NtAllocateVirtualMemory` in ntdll and serves large
+reservations from 8 GB up, so a lost upper half is fatal on demand. Hooking `VirtualAlloc`
+through the import tables catches nothing, because the engine takes its memory through the CRT
+and the CRT goes straight to ntdll.
 
-The criterion for calling this closed: **the game runs for hours under `-forcehighheap` exactly
-as it does without it**. Until that holds, the 32-bit legacy is alive and the current stability
-rests on the CRT placing the heap low, which is luck rather than a fix.
+What it found, in one evening:
+
+* The bucket allocator is not one piece of code. **Every module carries its own compiled copy**,
+  with its own globals. CrySoundSystem, CryRenderD3D11 and CryRenderD3D9 each have the same four
+  globals written 32 bits wide and read 64, the same list walk reading the next block's address
+  with half of it missing - eight places each.
+* CryScriptSystem's Lua pool swaps its free-list heads with a **32-bit compare-and-exchange**
+  while the code around it is already 64-bit. Eight places, in three shapes.
+* `-modfix` widens all of them: one REX bit where the length allows, a trampoline where the
+  64-bit form is longer. It refuses to touch an allocator that has already served a block.
+
+Measured, playing:
+
+| | below 4 GB | above 4 GB |
+|---|---|---|
+| without `-topdown` | 1831 MB | **0 MB** |
+| with `-topdown -modfix` | 1645 MB | **622 MB (27%)** |
+
+Before this, the 64-bit build never put a single byte above the 4 GB line - it was 64-bit in
+file format only. With the corrections in, TimesSquare, Downtown and CentralStation each load in
+their usual time and play with no exceptions at all.
+
+**Still open:** the other 73 percent. Most of the game's memory comes from the process heap,
+which reserved its first regions before the launcher could hook anything, and from file mappings
+for the .pak archives. Raising that share is what remains, along with running the whole campaign
+this way rather than three levels.
 
 ## Cosmetic
 
