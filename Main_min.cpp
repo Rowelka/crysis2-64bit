@@ -413,14 +413,26 @@ static void StartFaultSession(const char* cmdLine)
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 
-	// Keep the previous Game.log: the engine is about to overwrite it.
-	if (GetFileAttributesA("Game.log") != INVALID_FILE_ATTRIBUTES)
+	// Keep what the previous run left behind: the engine overwrites all of it on start, and
+	// a crash report is worth nothing once the next launch has erased it. error.log carries the
+	// engine's own stack trace, error.bmp the frame it died on.
+	static const char* const kKeep[] = { "Game.log", "error.log", "error.dmp", "error.bmp" };
+	for (int i = 0; i < 4; i++)
 	{
+		if (GetFileAttributesA(kKeep[i]) == INVALID_FILE_ATTRIBUTES) continue;
 		CreateDirectoryA("launcher_logs", NULL);
+
+		const char* dot = strrchr(kKeep[i], '.');
+		char stem[32];
+		const size_t n = dot ? (size_t)(dot - kKeep[i]) : strlen(kKeep[i]);
+		memcpy(stem, kKeep[i], n);
+		stem[n] = 0;
+
 		char kept[MAX_PATH];
-		sprintf(kept, "launcher_logs%cGame_%04u%02u%02u_%02u%02u%02u.log", 92,
-		        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-		MoveFileA("Game.log", kept);
+		sprintf(kept, "launcher_logs%c%s_%04u%02u%02u_%02u%02u%02u%s", 92, stem,
+		        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+		        dot ? dot : "");
+		MoveFileA(kKeep[i], kept);
 	}
 
 	char line[512];
