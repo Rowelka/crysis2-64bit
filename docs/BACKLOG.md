@@ -3,6 +3,29 @@
 What is reported, what is understood about each, and what it would take. Kept honest: an item
 sits here until it is fixed, not until it is explained.
 
+## Closed
+
+### Random crash in the 64-bit renderer, minutes into a level
+
+Closed 11.09.2026. The renderer caches D3D11 constant buffers in arrays indexed by the buffer's
+size in vectors, sized 512 / 128 / 128 by buffer type (the switch at `CryRenderD3D11` RVA
+`0x05A93A`, jump table at `0x05A9FC`). Nothing checks that the requested size fits the array:
+the entry point at `0x036E10` verifies only that `offset + count` fits the buffer itself.
+
+A skinning buffer asks for 224 vectors - about seventy-four bones - so for buffer type 1 the
+renderer reads entry 224 of a 128-entry array, takes whatever lies past its end for an
+`ID3D11Buffer`, and hands it to `Map`. Depending on what is there, the process either faults
+inside `d3d11.dll` at `+0x172FEB` reading `[rdx+0xC9]`, or faults on the read itself at
+`CryRenderD3D11+0x036F0E`. The main thread is left waiting on the render thread, so the engine's
+own watchdog reports `Runaway thread` and kills the process - which is what made this look like a
+hang rather than a crash.
+
+This explains the "crashes sometimes, usually after a few minutes" reports: it depends on which
+characters are on screen. Measured over 105-second runs of TimesSquare, one run in two died.
+
+The launcher now raises every array to 1024 entries before the table is built, which costs
+240 KB and covers every size the engine can request. On by default; `-nocbfix` disables it.
+
 ## From testers
 
 ### Low framerate in exclusive fullscreen

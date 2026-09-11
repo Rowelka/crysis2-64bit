@@ -2472,12 +2472,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 #endif
 	const bool timerRaised = (g_timeBeginPeriod && g_timeBeginPeriod(1) == 0);
 
-	// CrySystem stores one allocator pointer with a 32-bit write while every read of it is
-	// 64-bit, so the top half is dropped (see PatchSlabPointerWidth). The bug is real, but it
-	// only bites if an allocation lands above the 4 GB line, and in practice none does: the
-	// process is built against msvcr90, whose heap stays low. Verified by forcing the heap up
-	// with -forcehighheap, which startup survives either way. So the engine is left alone
-	// unless asked: -enginefix applies the correction.
+	// CrySystem writes allocator pointers 32 bits wide in eight places while every read of
+	// them is 64-bit, so the top half is dropped (see PatchSlabPointerWidth). On this build the
+	// heap normally stays below the 4 GB line - the process is built against msvcr90 - and the
+	// bug lies dormant; on a machine whose address space is laid out differently it does not.
+	//
+	// The corrections are applied by default now that they have been checked both ways. Each one
+	// only widens a store that was already meant to be 64-bit, and nothing in CrySystem reads
+	// the four bytes above any of these globals as a variable of its own (verified for every
+	// site), so where the heap is low the patched code writes the same value with zeroes above
+	// it and behaves identically. -noenginefix leaves the engine untouched for comparison, and
+	// -enginefix:<mask> still selects individual sites.
 	{
 		const char* arg = lpCmdLine ? strstr(lpCmdLine, "-enginefix") : 0;
 		if (arg && (arg[10] == ':' || arg[10] == '='))
@@ -2486,9 +2491,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 			if (sscanf(arg + 11, "%x", &v) == 1 && v) g_fixMask = v;
 		}
 	}
-	const char* slabFix = (lpCmdLine && strstr(lpCmdLine, "-enginefix"))
-	                    ? PatchSlabPointerWidth()
-	                    : "off (engine untouched)";
+	const char* slabFix = (lpCmdLine && strstr(lpCmdLine, "-noenginefix"))
+	                    ? "off (engine untouched)"
+	                    : PatchSlabPointerWidth();
 
 	// Diagnostic: watch what the engine asks the allocator for, and what it gets back.
 	const char* allocTrace = (lpCmdLine && strstr(lpCmdLine, "-traceallocs"))

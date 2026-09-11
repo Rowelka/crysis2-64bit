@@ -78,7 +78,11 @@ your machine and not on mine" into something answerable:
 |---|---|
 | `-traceallocs` | log every large engine allocation, its size and the address it got, to `launcher_faults.txt` |
 | `-forcehighheap` | reserve all free memory below the 4 GB line before engine init, forcing the heap above it |
-| `-enginefix` | apply the pointer-width correction described below (off by default) |
+| `-noenginefix` | leave the pointer-width corrections out (they are applied by default) |
+| `-enginefix:<mask>` | apply only selected correction sites, one bit each, for comparison |
+| `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
+| `-arenahigh` | serve the allocator's arenas from above the 4 GB line, to exercise the corrections |
+| `-cbwatch` | arm a hardware watchpoint on the constant-buffer cache (suspends every thread once) |
 
 `-forcehighheap` exists because pointer truncation only shows up when memory lands high, which on
 most machines it never does. The flag makes that condition happen on demand, so a fix can be
@@ -264,7 +268,9 @@ Command line flags:
 | `-allowmultiple` | start a second copy without asking |
 | `-traceallocs` | log large engine allocations to `launcher_faults.txt` |
 | `-forcehighheap` | force the heap above the 4 GB line, to reproduce truncation on demand |
-| `-enginefix` | apply the pointer-width correction (off by default) |
+| `-noenginefix` | leave the pointer-width corrections out (applied by default) |
+| `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
+| `-arenahigh` | serve allocator arenas from above the 4 GB line |
 
 ## Building
 

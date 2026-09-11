@@ -91,8 +91,10 @@ reload of a register the next instruction overwrites anyway:
 ```
 
 Padding out the reload frees the byte the prefix needs, and because the store still ends at the
-same address its displacement does not change. That is `-enginefix`, and it is off by default -
-see below for why.
+same address its displacement does not change. That is the pointer-width correction, applied by
+default since 11.09.2026 - `-noenginefix` leaves the engine untouched. It was off originally
+because the heap of this build stays low and the bug lies dormant; that is true of this machine
+and not of every machine, and the corrections have since been checked both ways.
 
 The editor survives it because its primary CRT is `msvcr90`, whose heap lands low. Building the
 launcher with the VC90 compiler from WDK 7.1 and linking `msvcr90` as the primary CRT (`/MD`)
