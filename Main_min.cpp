@@ -2237,6 +2237,247 @@ static const char* WidenModule(const char* name, const WidenSite* sites, unsigne
 	return result;
 }
 
+// The Lua pool in CryScriptSystem, which swaps list heads with a 32-bit compare-and-exchange.
+//
+// The allocator keeps three lock-free stacks of free blocks. Pushing and popping looks like this:
+//
+//   mov rbx, qword ptr [head]      ; the head, read in full
+//   lea rcx, [head]
+//   mov edx, edi                   ; the new head - HALF a pointer
+//   mov r8d, ebx                   ; the expected head - HALF a pointer
+//   mov qword ptr [rdi+0x10], rbx  ; item->next, written in full
+//   call <lock cmpxchg dword ptr [rcx], edx>
+//
+// Half of the code is already 64-bit and half is not, which is what makes it invisible while
+// everything sits low. With memory above the 4 GB line the head becomes a pointer with nothing
+// in its upper half, and the first read through it dies - the game never gets past Lua.
+//
+// Each of the five places is replaced by a trampoline that does the same thing in full width:
+// the addresses go into rdx and r8 whole, and the exchange becomes "lock cmpxchg qword".
+//
+// The blocks are 22 to 31 bytes, so a 5-byte jump fits with room to spare, and the retry branch
+// keeps pointing at the instruction that re-reads the head.
+#define LUA_SITES 8
+
+struct LuaCasSite
+{
+	unsigned             rva;      // start of the block being replaced
+	unsigned             len;      // how much of it
+	unsigned             retry;    // where the CAS failure path goes
+	unsigned             done;     // where control continues on success
+	unsigned             head;     // the global holding the list head
+	const unsigned char* bytes;
+};
+
+static const unsigned char kLua0[] = {          // pop: next comes from the block itself
+	0x8B, 0x53, 0x10,                           // mov edx, [rbx+0x10]
+	0x48, 0x8D, 0x0D, 0xFE, 0xFB, 0x09, 0x00,   // lea rcx, [head]
+	0x44, 0x8B, 0xC3,                           // mov r8d, ebx
+	0xE8, 0x7E, 0x67, 0xFF, 0xFF,               // call cas32
+	0x3B, 0xC3,                                 // cmp eax, ebx
+	0x75, 0xDA                                  // jne retry
+};
+static const unsigned char kLua1[] = {          // push, item in rdi
+	0x48, 0x8D, 0x0D, 0x8A, 0xFB, 0x09, 0x00,
+	0x8B, 0xD7,                                 // mov edx, edi
+	0x44, 0x8B, 0xC3,
+	0x48, 0x89, 0x5F, 0x10,                     // mov [rdi+0x10], rbx
+	0xE8, 0x04, 0x67, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE0
+};
+static const unsigned char kLua2[] = {          // push, item in rdi, different head
+	0x48, 0x8D, 0x0D, 0x1A, 0xFA, 0x09, 0x00,
+	0x8B, 0xD7,
+	0x44, 0x8B, 0xC3,
+	0x48, 0x89, 0x5F, 0x10,
+	0xE8, 0xA4, 0x65, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE0
+};
+static const unsigned char kLua3[] = {          // push, the head goes through the stack
+	0x48, 0x8D, 0x0D, 0xF2, 0xF9, 0x09, 0x00,
+	0x8B, 0xD7,
+	0x48, 0x89, 0x44, 0x24, 0x50,               // mov [rsp+0x50], rax
+	0x48, 0x8B, 0x5C, 0x24, 0x50,               // mov rbx, [rsp+0x50]
+	0x44, 0x8B, 0xC3,
+	0xE8, 0x7E, 0x65, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xDA
+};
+static const unsigned char kLua4[] = {          // push, item in rsi
+	0x48, 0x8D, 0x0D, 0xCA, 0xF9, 0x09, 0x00,
+	0x8B, 0xD6,                                 // mov edx, esi
+	0x44, 0x8B, 0xC3,
+	0x48, 0x89, 0x5E, 0x10,                     // mov [rsi+0x10], rbx
+	0xE8, 0x44, 0x65, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE0
+};
+
+// The same bug where the list head is not a global but an address already in a register:
+// a per-size-class array of heads. Nothing to recompute, so 'head' is zero for these.
+static const unsigned char kLua5[] = {          // push, head at [rsi], item in rdi
+	0x8B, 0xD7,                                 // mov edx, edi
+	0x48, 0x8B, 0xCE,                           // mov rcx, rsi
+	0x44, 0x8B, 0xC3,                           // mov r8d, ebx
+	0x48, 0x89, 0x1F,                           // mov [rdi], rbx
+	0xE8, 0x7D, 0x6B, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE9
+};
+static const unsigned char kLua6[] = {          // push, head at [rbp], item in r13
+	0x41, 0x8B, 0xD5,                           // mov edx, r13d
+	0x48, 0x8B, 0xCD,                           // mov rcx, rbp
+	0x44, 0x8B, 0xC0,                           // mov r8d, eax
+	0x48, 0x89, 0x07,                           // mov [rdi], rax
+	0x8B, 0xD8,                                 // mov ebx, eax
+	0xE8, 0x89, 0x5D, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE5
+};
+static const unsigned char kLua7[] = {          // pop, head at [rdi]
+	0x8B, 0x13,                                 // mov edx, [rbx]
+	0x44, 0x8B, 0xC3,                           // mov r8d, ebx
+	0x48, 0x8B, 0xCF,                           // mov rcx, rdi
+	0xE8, 0xB4, 0x54, 0xFF, 0xFF,
+	0x3B, 0xC3,
+	0x75, 0xE7
+};
+
+static const LuaCasSite kLuaSites[LUA_SITES] = {
+	{ 0x00AF70, sizeof(kLua0), 0x00AF60, 0x00AF86, 0x0AAB78, kLua0 },
+	{ 0x00AFE7, sizeof(kLua1), 0x00AFE0, 0x00B000, 0x0AAB78, kLua1 },
+	{ 0x00B147, sizeof(kLua2), 0x00B140, 0x00B160, 0x0AAB68, kLua2 },
+	{ 0x00B167, sizeof(kLua3), 0x00B160, 0x00B186, 0x0AAB60, kLua3 },
+	{ 0x00B1A7, sizeof(kLua4), 0x00B1A0, 0x00B1C0, 0x0AAB78, kLua4 },
+	{ 0x00AB73, sizeof(kLua5), 0x00AB70, 0x00AB87, 0,        kLua5 },
+	{ 0x00B964, sizeof(kLua6), 0x00B960, 0x00B97B, 0,        kLua6 },
+	{ 0x00C23F, sizeof(kLua7), 0x00C237, 0x00C250, 0,        kLua7 },
+};
+
+static const char* PatchLuaPool(void)
+{
+	static char result[160];
+
+	unsigned char* base = (unsigned char*)GetModuleHandleA("CryScriptSystem.dll");
+	if (!base) return "not loaded";
+
+	unsigned char* cave = 0;
+	size_t used = 0;
+	unsigned done = 0;
+	const char* why = 0;
+
+	for (int i = 0; i < LUA_SITES; i++)
+	{
+		const LuaCasSite* s = &kLuaSites[i];
+		unsigned char* at = base + s->rva;
+		if (memcmp(at, s->bytes, s->len) != 0) { if (!why) why = "no match"; continue; }
+
+		if (!cave)
+		{
+			cave = AllocCaveNear(base);
+			if (!cave) return "no cave";
+		}
+		if (used + 72 > kCaveSize) { why = "cave full"; break; }
+
+		unsigned char* code = cave + used;
+		int n = 0;
+
+		if (s->head)
+		{
+			// The head's address, whole, so no displacement has to be recomputed.
+			code[n++] = 0x48; code[n++] = 0xB9;                   // mov rcx, imm64
+			const unsigned long long g = (unsigned long long)(ULONG_PTR)(base + s->head);
+			memcpy(code + n, &g, 8); n += 8;
+		}
+
+		// The parts that differ: where the new head comes from, and where the old one lives.
+		if (i == 0)
+		{
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x53; code[n++] = 0x10; // mov rdx,[rbx+0x10]
+		}
+		else if (i == 4)
+		{
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xD6;                  // mov rdx, rsi
+		}
+		else if (i == 5)
+		{
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xD7;                  // mov rdx, rdi
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCE;                  // mov rcx, rsi
+		}
+		else if (i == 6)
+		{
+			code[n++] = 0x49; code[n++] = 0x8B; code[n++] = 0xD5;                  // mov rdx, r13
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCD;                  // mov rcx, rbp
+		}
+		else if (i == 7)
+		{
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x13;                  // mov rdx, [rbx]
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xCF;                  // mov rcx, rdi
+		}
+		else
+		{
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xD7;                  // mov rdx, rdi
+		}
+
+		if (i == 3)
+		{
+			code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x44; code[n++] = 0x24; code[n++] = 0x50;
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0x5C; code[n++] = 0x24; code[n++] = 0x50;
+		}
+
+		if (i == 6)
+		{
+			code[n++] = 0x4C; code[n++] = 0x8B; code[n++] = 0xC0;                  // mov r8, rax
+			code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x07;                  // mov [rdi], rax
+			code[n++] = 0x48; code[n++] = 0x8B; code[n++] = 0xD8;                  // mov rbx, rax
+		}
+		else
+		{
+			code[n++] = 0x4C; code[n++] = 0x8B; code[n++] = 0xC3;                  // mov r8, rbx
+		}
+
+		if (i == 1 || i == 2)
+		{
+			code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x5F; code[n++] = 0x10; // mov [rdi+0x10], rbx
+		}
+		else if (i == 4)
+		{
+			code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x5E; code[n++] = 0x10; // mov [rsi+0x10], rbx
+		}
+		else if (i == 5)
+		{
+			code[n++] = 0x48; code[n++] = 0x89; code[n++] = 0x1F;                   // mov [rdi], rbx
+		}
+
+		// The exchange itself, now eight bytes wide.
+		code[n++] = 0x49; code[n++] = 0x8B; code[n++] = 0xC0;                      // mov rax, r8
+		code[n++] = 0xF0; code[n++] = 0x48; code[n++] = 0x0F; code[n++] = 0xB1;
+		code[n++] = 0x11;                                                          // lock cmpxchg [rcx], rdx
+		code[n++] = 0x48; code[n++] = 0x3B; code[n++] = 0xC3;                      // cmp rax, rbx
+
+		code[n++] = 0x0F; code[n++] = 0x85;                                        // jne retry
+		{
+			const long rel = (long)((base + s->retry) - (code + n + 4));
+			memcpy(code + n, &rel, 4); n += 4;
+		}
+		code[n++] = 0xE9;                                                          // jmp done
+		{
+			const long rel = (long)((base + s->done) - (code + n + 4));
+			memcpy(code + n, &rel, 4); n += 4;
+		}
+
+		if (!WriteJump(at, code, s->len)) { why = "jump failed"; continue; }
+		used += (size_t)n;
+		done++;
+	}
+
+	if (done == LUA_SITES) sprintf(result, "all %d widened", LUA_SITES);
+	else sprintf(result, "%u of %d widened (%s)", done, LUA_SITES, why ? why : "?");
+	return result;
+}
+
 // Which modules carry a copy, and where.
 static const struct { const char* name; const WidenSite* sites; unsigned count; } kWidenWork[] = {
 	{ "CrySoundSystem.dll", kSndSites, 8 },
@@ -2245,6 +2486,17 @@ static const struct { const char* name; const WidenSite* sites; unsigned count; 
 };
 
 static volatile LONG g_widened[3] = { 0, 0, 0 };
+static volatile LONG g_luaWidened = 0;
+
+static void WidenLuaOnce(void)
+{
+	if (InterlockedCompareExchange(&g_luaWidened, 1, 0) != 0) return;
+
+	const char* r = PatchLuaPool();
+	char line[192];
+	int n = sprintf(line, "  modfix: CryScriptSystem.dll: %s%s", r, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
 
 // Widens one module if it is loaded and has not been done yet. Safe to call from anywhere.
 static void WidenIfNeeded(int i)
@@ -2290,6 +2542,8 @@ static VOID CALLBACK OnModuleLoaded(ULONG reason, const LDR_NOTIFICATION_DATA* d
 
 	for (int i = 0; i < 3; i++)
 		if (_stricmp(name, kWidenWork[i].name) == 0) WidenIfNeeded(i);
+
+	if (_stricmp(name, "CryScriptSystem.dll") == 0) WidenLuaOnce();
 }
 
 static bool RegisterLoaderNotification(void)
@@ -2319,6 +2573,7 @@ static DWORD WINAPI ModuleFixThread(LPVOID)
 	{
 		for (int i = 0; i < 3; i++)
 			if (!g_widened[i] && GetModuleHandleA(kWidenWork[i].name)) WidenIfNeeded(i);
+		if (!g_luaWidened && GetModuleHandleA("CryScriptSystem.dll")) WidenLuaOnce();
 		if (early && g_widened[0] && g_widened[1]) break;
 		Sleep(5);
 	}
