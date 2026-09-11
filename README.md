@@ -14,19 +14,49 @@ The game is completable start to finish on this launcher (verified by an externa
 
 ## Installation
 
-You need **Crysis 2** patched to 1.9 (the Maximum Edition already is) and the **Crysis 2 Mod SDK**.
-The Mod SDK is what puts the 64-bit engine DLLs into the game's `Bin64` folder - without it there
-is nothing here to run.
+### What you need
 
-1. Install Crysis 2, then install the Crysis 2 Mod SDK into the same folder.
-2. Download `launcher64.exe` from the [Releases](https://github.com/Rowelka/crysis2-64bit/releases) page.
-3. Put it in `<game folder>\Bin64\`, next to `CrySystem.dll` and `Editor.exe`.
+Three things, and two of them are downloads.
+
+| | Where |
+|---|---|
+| **Crysis 2**, patched to **1.9** | Maximum Edition and the Steam release are already 1.9. A disc copy normally needs the patch. |
+| **Crysis 2 Mod SDK** (free, by Crytek) | [archive.org](https://archive.org/details/Crysis2ModSDK1.0) - 1.4 GB, the file carries Crytek's own signature. Also on [ModDB](https://www.moddb.com/downloads/crysis-2-sdk). |
+| **`launcher64.exe`** | The [Releases](https://github.com/Rowelka/crysis2-64bit/releases) page here. One file, about 50 KB. |
+
+The Mod SDK is not optional and it is not a nice-to-have: **the 64-bit engine lives inside it**.
+Retail Crysis 2 ships a 32-bit game only, so without the SDK there is nothing on your disk for
+this launcher to start. The SDK installs those 64-bit files into the game's `Bin64` folder.
+
+### Steps
+
+1. Install Crysis 2 and make sure it is patched to 1.9.
+2. Install the Mod SDK **into the same folder as the game**.
+3. Copy `launcher64.exe` into `Bin64`, next to `CrySystem.dll`.
 4. Run `launcher64.exe`.
+
+When it is in the right place, the folder looks like this:
+
+```
+Crysis 2\
+  Bin32\Crysis2.exe       the original 32-bit game, untouched
+  Bin64\CrySystem.dll     came with the Mod SDK
+  Bin64\launcher64.exe    what you downloaded
+```
 
 Nothing is overwritten and no game file is modified - the original 32-bit `Crysis2.exe` keeps
 working exactly as before. To uninstall, delete `launcher64.exe`.
 
-### If something goes wrong
+### If it does not start
+
+The launcher checks the common mistakes itself and says what is wrong in plain words, including
+the folder it looked in. If you get one of these boxes:
+
+| What it says | What to do |
+|---|---|
+| The 64-bit engine (CrySystem.dll) was not found | `launcher64.exe` is not in `Bin64`, or the Mod SDK was never installed. Check the folder layout above. |
+| CrySystem.dll does not export CreateSystemInterface | The engine files are from a different game or SDK. Reinstall the Crysis 2 Mod SDK. |
+| The engine failed to start up | Send `Game.log` and `launcher_diag.txt` (both in the Crysis 2 folder) with a bug report. |
 
 Every launch writes `launcher_diag.txt` into the game folder, listing your hardware, display mode,
 and the versions of every engine module and pak. Attach that file to a bug report; it usually
@@ -269,13 +299,15 @@ name the install yourself:
 | `-Kit` | Windows SDK `bin\<version>\x64`, if the newest installed one is not wanted |
 | `-NoDeploy` | build only, do not copy the result into the game |
 
-The script generates `CrySystem.lib` from `CrySystem.def`, extracts the cursors, compiles the
-resource script, builds `Main_min.cpp`, embeds the VC90 CRT manifest, and copies the result into
-the game's `Bin64`.
+The script extracts the cursors, compiles the resource script, builds `Main_min.cpp`, embeds the
+VC90 CRT manifest, and copies the result into the game's `Bin64`.
 
-Two files are deliberately absent from this repository and produced at build time instead:
-`CrySystem.lib`, which is derived from the game's own DLL, and the cursor `.cur` files, which are
-Crytek assets. Neither is ours to distribute.
+Nothing links against the engine. `CreateSystemInterface` is resolved with `LoadLibrary` at
+startup, so no import library is generated and none is needed - and a missing or misplaced engine
+produces an explanation from the launcher rather than Windows' "reinstall the program" box.
+
+The cursor `.cur` files are absent from this repository on purpose and extracted from the
+installation at build time: they are Crytek assets, not ours to distribute.
 
 ### Testing a build
 

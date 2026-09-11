@@ -89,5 +89,7 @@ struct IGameStartup
 	virtual int Run( const char * autoStartLevelName ) = 0;
 };
 
-// Retail exports this undecorated, so it is imported statically through CrySystem.lib.
-extern "C" ISystem* CreateSystemInterface(const SSystemInitParams &startupParams);
+// Retail exports this undecorated. It is resolved at runtime rather than imported, so that a
+// missing or misplaced engine can be explained by the launcher instead of by Windows, whose
+// own message for a missing DLL tells the player to reinstall - which fixes nothing here.
+typedef ISystem* (*CreateSystemInterfaceFn)(const SSystemInitParams &startupParams);

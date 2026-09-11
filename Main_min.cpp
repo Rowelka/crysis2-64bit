@@ -849,6 +849,59 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	fclose(f);
 }
 
+// What a player sees when a piece of the 64-bit engine is not where it has to be.
+//
+// Left to Windows, a missing CrySystem.dll produces "the system cannot find CrySystem.dll, try
+// reinstalling the program" - which points at the wrong thing entirely: reinstalling the
+// launcher changes nothing, and the retail game does not contain these files at all. They come
+// with the Mod SDK. So the launcher says that itself, and says where it looked.
+static void ExplainMissing(const char* what)
+{
+	char dir[MAX_PATH];
+	GetModuleFileNameA(NULL, dir, MAX_PATH);
+	char* p = strrchr(dir, '\\');
+	if (p) *p = 0;
+
+	char msg[1200];
+	sprintf(msg,
+	        "%s was not found.\n\n"
+	        "Looked in:\n    %s\n\n"
+	        "launcher64.exe has to sit in the game's Bin64 folder, next to the 64-bit engine "
+	        "files (CrySystem.dll and the other Cry*.dll).\n\n"
+	        "Those files are not part of the retail game - the disc and the store versions ship "
+	        "a 32-bit game only. They come with the free Crysis 2 Mod SDK.\n\n"
+	        "Install the Mod SDK into your Crysis 2 folder, then copy launcher64.exe into\n"
+	        "    <Crysis 2>\\Bin64\\\n"
+	        "and start it from there.",
+	        what, dir);
+	MessageBoxA(NULL, msg, "Crysis 2 - 64-bit launcher", MB_OK | MB_ICONINFORMATION);
+}
+
+// The engine entry point, resolved by hand so the case above can be caught. Retail exports it
+// undecorated, so no name mangling is involved.
+static CreateSystemInterfaceFn LoadEngine(void)
+{
+	HMODULE engine = LoadLibraryA("CrySystem.dll");
+	if (!engine)
+	{
+		ExplainMissing("The 64-bit engine (CrySystem.dll)");
+		return 0;
+	}
+
+	CreateSystemInterfaceFn fn =
+		(CreateSystemInterfaceFn)GetProcAddress(engine, "CreateSystemInterface");
+	if (!fn)
+	{
+		MessageBoxA(NULL,
+		            "CrySystem.dll was found, but it does not export CreateSystemInterface.\n\n"
+		            "This usually means the file belongs to a different CryEngine game or a "
+		            "different SDK version. The one needed here comes with the Crysis 2 Mod SDK.",
+		            "Crysis 2 - 64-bit launcher", MB_OK | MB_ICONINFORMATION);
+		return 0;
+	}
+	return fn;
+}
+
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
 	// Starting a second copy by accident is easy and confusing: both instances run, both eat
@@ -864,6 +917,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 				return 0;
 		}
 	}
+
+	// Resolve the engine before anything else is set up. The static import used to bind here
+	// too, at process start, so nothing about the load order changes - only the error message.
+	CreateSystemInterfaceFn pCreateSystem = LoadEngine();
+	if (!pCreateSystem) return 0;
 
 	// Before engine init: 15.625 ms -> 1 ms (see the note above timeBeginPeriod).
 #ifndef NO_TIMER_LOAD
@@ -956,8 +1014,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 #endif
 
 	// Bring up the engine's memory system first, in the same order the editor does.
-	ISystem* pSystem = CreateSystemInterface(startupParams);
-	if (!pSystem) { MessageBoxA(0, "CreateSystemInterface failed (engine init)!", "Launcher", MB_OK); return 0; }
+	ISystem* pSystem = pCreateSystem(startupParams);
+	if (!pSystem)
+	{
+		MessageBoxA(NULL,
+		            "The engine failed to start up.\n\n"
+		            "Game.log in the Crysis 2 folder holds the engine's own account of what "
+		            "happened, and launcher_diag.txt next to it describes this machine. Both "
+		            "are worth attaching to a bug report.",
+		            "Crysis 2 - 64-bit launcher", MB_OK | MB_ICONINFORMATION);
+		return 0;
+	}
 
 	// Hand the ready system to the game DLL, which reuses it instead of building a second one
 	// (ISystem.h: pSystem is "reused if not NULL"). Without this the game brings up its own
@@ -1114,13 +1181,30 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
 	// Load the game DLL and take its entry point.
 	HMODULE gameDll = LoadLibraryA("CryGameCrysis2.dll");
-	if (!gameDll) { MessageBoxA(0, "Failed to load CryGameCrysis2.dll!", "Launcher", MB_OK); return 0; }
+	if (!gameDll) { ExplainMissing("The game library (CryGameCrysis2.dll)"); return 0; }
 
 	IGameStartup::TEntryFunction pCreate = (IGameStartup::TEntryFunction)GetProcAddress(gameDll, "CreateGameStartup2");
-	if (!pCreate) { MessageBoxA(0, "CreateGameStartup2 not found in game DLL!", "Launcher", MB_OK); return 0; }
+	if (!pCreate)
+	{
+		MessageBoxA(NULL,
+		            "CryGameCrysis2.dll was found, but it does not export CreateGameStartup2.\n\n"
+		            "The file is probably from a different game or SDK version than the engine "
+		            "next to it. Reinstalling the Crysis 2 Mod SDK restores a matching set.",
+		            "Crysis 2 - 64-bit launcher", MB_OK | MB_ICONINFORMATION);
+		return 0;
+	}
 
 	IGameStartup* pGameStartup = pCreate();
-	if (!pGameStartup) { MessageBoxA(0, "CreateGameStartup failed!", "Launcher", MB_OK); return 0; }
+	if (!pGameStartup)
+	{
+		MessageBoxA(NULL,
+		            "The game library refused to start.\n\n"
+		            "Game.log in the Crysis 2 folder holds the engine's own account of what "
+		            "happened, and launcher_diag.txt next to it describes this machine. Both "
+		            "are worth attaching to a bug report.",
+		            "Crysis 2 - 64-bit launcher", MB_OK | MB_ICONINFORMATION);
+		return 0;
+	}
 
 	// Initialise the game (reusing the system created above) and enter the main loop.
 	if (pGameStartup->Init(startupParams))   // IGameRef converts to non-null on success

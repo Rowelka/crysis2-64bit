@@ -76,18 +76,6 @@ $env:LIB     = (Join-Path $Wdk "lib\crt\amd64") + ";" + (Join-Path $Wdk "lib\win
 Set-Location $dir
 if (Test-Path $out) { Remove-Item $out -Force }
 
-# The import library for CrySystem is generated from the .def rather than shipped: it derives
-# from the game's own DLL, so it is not ours to distribute, and generating it keeps this
-# repository to source only. link /lib does the job - the WDK has no separate lib.exe.
-$csLib = Join-Path $dir "CrySystem.lib"
-if (-not (Test-Path $csLib)) {
-    # Both paths go through variables: PowerShell splits "/def:(expression)" into two separate
-    # arguments, and link then reports a missing argument for the option that follows.
-    $csDef = Join-Path $dir "CrySystem.def"
-    & (Join-Path $Wdk "bin\x86\amd64\link.exe") /lib /nologo "/def:$csDef" /machine:x64 "/out:$csLib"
-    if (-not (Test-Path $csLib)) { throw "failed to generate CrySystem.lib from CrySystem.def" }
-}
-
 # Cursor resources: the game calls LoadCursorA against its own executable, which is this
 # launcher. Without them the in-game cursor is invisible (the mouse still works). The .cur
 # files are Crytek assets and are not stored here - they are extracted from the installation.
@@ -104,7 +92,7 @@ if ((Test-Path (Join-Path $dir "res\cursor_103.cur")) -and $rc -and (Test-Path $
 }
 
 $clArgs = @("/nologo", "/EHsc", "/MD", "/DWIN64", "/D_WIN64", "/I.", "Main_min.cpp", "/Fe$out",
-            "/link", "CrySystem.lib", "kernel32.lib", "user32.lib", "shell32.lib", "gdi32.lib")
+            "/link", "kernel32.lib", "user32.lib", "shell32.lib", "gdi32.lib")
 if (Test-Path $resFile) { $clArgs += $resFile }
 $clArgs += @("/MACHINE:X64", "/SUBSYSTEM:WINDOWS", "/MANIFEST")
 
