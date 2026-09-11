@@ -6,6 +6,16 @@
 // pointers get corrupted. Building against msvcr90 as the primary CRT (/MD) puts the heap
 // low, exactly where it lands in the editor, and the truncation becomes harmless.
 // CrySystem is imported statically so it loads alongside msvcr90 in the right order.
+//
+// A few pieces can be compiled out, which is how the cause of a startup failure was narrowed
+// down once: build variants that differ by exactly one thing, run each three times, and compare.
+// Working forward from a build that starts, rather than backward from one that does not, is what
+// makes that useful - see docs/FINDINGS.md.
+//
+//     /DNO_DIAG          skip the diagnostic report
+//     /DNO_TIMER_LOAD    do not load WINMM or raise the timer resolution
+//     /DNO_DETECTOR      do not install the access-violation handler
+//     /DNO_SLABFIX       leave out the engine pointer-width patch entirely
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -280,7 +290,7 @@ static DWORD WINAPI BorderlessThread(LPVOID)
 		ApplyBorderless(s.found, w, hgt);
 		if (!logged) {
 			FILE* f = fopen("launcher_diag.txt", "a");
-			if (f) { fprintf(f, "[run91] borderless applied: hwnd=%p %dx%d\n", (void*)s.found, w, hgt); fclose(f); }
+			if (f) { fprintf(f, "borderless     : applied to window %p at %dx%d\n", (void*)s.found, w, hgt); fclose(f); }
 			logged = true;
 		}
 	}
@@ -304,7 +314,330 @@ static void DiagLine(FILE* f, const char* fmt, ...)
 	fputc('\n', f);
 }
 
-static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderless)
+// ---------------------------------------------------------------------------------------
+// The pointer truncation that makes this engine build fail on some machines and not others.
+//
+// Retail CrySystem's bucket allocator keeps the head of its free-page list in a global.
+// Every read of that global is 64-bit, but the one instruction that writes it is 32-bit:
+//
+//     RVA 0x0A16F1 / 0x0A1715 / 0x0A1A30   mov rXX, [rip+...]     64-bit reads
+//     RVA 0x0A1A49                         mov [rip+...], ebp     32-bit write
+//
+// So the top half of the pointer is dropped on the way in and read back as zero. While the
+// process heap happens to sit below the 4 GB line the dropped half is zero anyway and nothing
+// notices. The moment one block lands above that line, the value read back addresses a low
+// address that was never mapped. That is the "Failed CMTSafeHeap::m_pBigPool allocation" box
+// at startup, and the access violations on unmapped low addresses once a level is loaded.
+//
+// Where the heap lands is decided by the layout of the address space, which is why the same
+// files work on one machine and fail on the next, and why the same machine can differ between
+// two runs: driver DLLs, overlays and ASLR all move the boundary.
+//
+// The instruction is exactly one REX.W prefix short of being correct. Immediately before it:
+//
+//     mov [rsp+40h], rax
+//     mov rax, [rsp+40h]     <- reloads the register just stored, and the next instruction
+//                               (lea rax, [rbp+80000h]) overwrites rax regardless
+//
+// That reload is dead. Replacing it with padding frees the byte the prefix needs, and since
+// the store still ends at the same address its RIP-relative displacement stays correct.
+//
+// Bin64 comes from the Mod SDK and is byte-identical for everyone, so a fixed offset is safe
+// here - but the patch still verifies the exact bytes and declines if they differ.
+// ---------------------------------------------------------------------------------------
+// Detector for truncated pointers.
+//
+// A pointer that lost its top half addresses somewhere in the low 4 GB, which in a 64-bit
+// process is almost always unmapped. So an access violation on a low address is the signature
+// of this bug, and the fault tells us exactly which instruction dereferenced it.
+//
+// The handler only observes: it writes a record and lets the exception continue to whoever
+// would have handled it, so behaviour is unchanged. Used together with -forcehighheap, which
+// makes the fault happen on demand rather than by luck, this turns "find the truncations" from
+// guesswork into a loop: run, read the address, find who wrote that pointer, fix, run again.
+//
+// Deliberately avoids the CRT: at fault time the heap may be the very thing that is broken.
+#define MAX_FAULT_RECORDS 32
+static volatile long g_faultsLogged = 0;
+
+static void AppendFaultLog(const char* text, unsigned long len)
+{
+	HANDLE h = CreateFileA("launcher_faults.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+	                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) return;
+	DWORD written = 0;
+	SetFilePointer(h, 0, NULL, FILE_END);
+	WriteFile(h, text, len, &written, NULL);
+	CloseHandle(h);
+}
+
+// Names the module an address belongs to, without pulling in psapi: the allocation base of a
+// mapped image is its module handle.
+static const char* ModuleAt(ULONG_PTR addr, ULONG_PTR* rvaOut)
+{
+	static char path[MAX_PATH];
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) return 0;
+	if (!mbi.AllocationBase) return 0;
+	if (!GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, MAX_PATH)) return 0;
+
+	*rvaOut = addr - (ULONG_PTR)mbi.AllocationBase;
+	const char* slash = strrchr(path, 92);          // last backslash
+	return slash ? slash + 1 : path;
+}
+
+static bool AddressIsMapped(ULONG_PTR addr)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) return false;
+	return mbi.State == MEM_COMMIT;
+}
+
+static LONG CALLBACK TruncationVEH(EXCEPTION_POINTERS* ep)
+{
+	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+	if (g_faultsLogged >= MAX_FAULT_RECORDS) return EXCEPTION_CONTINUE_SEARCH;
+
+	const ULONG_PTR addr = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
+	const ULONG_PTR op   = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[0];
+	if (addr >= (ULONG_PTR)0x100000000) return EXCEPTION_CONTINUE_SEARCH;   // not this signature
+
+	InterlockedIncrement(&g_faultsLogged);
+
+	const CONTEXT* c = ep->ContextRecord;
+	const ULONG_PTR regs[16] = {
+		c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi,
+		c->R8,  c->R9,  c->R10, c->R11, c->R12, c->R13, c->R14, c->R15
+	};
+	static const char* const names[16] = {
+		"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+		"r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"
+	};
+
+	char buf[2048];
+	int n = 0;
+	ULONG_PTR rva = 0;
+	const char* mod = ModuleAt((ULONG_PTR)c->Rip, &rva);
+
+	n += sprintf(buf + n, "=== access violation on a low address ===%s", "\n");
+	n += sprintf(buf + n, "  faulting code : %s+0x%08llX%s",
+	             mod ? mod : "(unknown)", (unsigned long long)rva, "\n");
+	n += sprintf(buf + n, "  operation     : %s%s",
+	             op == 0 ? "read" : (op == 1 ? "write" : "execute"), "\n");
+	n += sprintf(buf + n, "  address       : 0x%016llX (%s)%s", (unsigned long long)addr,
+	             addr < 0x10000 ? "null-ish, probably not truncation" : "unmapped low address",
+	             "\n");
+
+	// The most useful line: a register whose low half equals the faulting address but whose top
+	// half is still intact is the original pointer, and names what was truncated on the way in.
+	for (int i = 0; i < 16; ++i) {
+		if ((regs[i] & 0xFFFFFFFF) == (addr & 0xFFFFFFFF) && (regs[i] >> 32) != 0)
+			n += sprintf(buf + n, "  intact copy   : %s = 0x%016llX  <- pointer before truncation%s",
+			             names[i], (unsigned long long)regs[i], "\n");
+	}
+	for (int i = 0; i < 16; ++i) {
+		if (regs[i] == addr)
+			n += sprintf(buf + n, "  held in       : %s%s", names[i], "\n");
+	}
+
+	n += sprintf(buf + n, "  registers     :%s", "\n");
+	for (int i = 0; i < 16; i += 4) {
+		n += sprintf(buf + n, "    %s=%016llX %s=%016llX %s=%016llX %s=%016llX%s",
+		             names[i],   (unsigned long long)regs[i],
+		             names[i+1], (unsigned long long)regs[i+1],
+		             names[i+2], (unsigned long long)regs[i+2],
+		             names[i+3], (unsigned long long)regs[i+3], "\n");
+	}
+	n += sprintf(buf + n, "%s", "\n");
+
+	AppendFaultLog(buf, (unsigned long)n);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ---------------------------------------------------------------------------------------
+// A proxy over the engine's main allocation entry point.
+//
+// The constructor of the pak heap calls it through a pointer and gives up if the result is
+// null (CrySystem RVA 0x0A2253 calls, 0x0A2280 tests, 0x0A2285 raises the fatal error). The
+// store and the test are both 64-bit and correct, so the allocator really does return zero -
+// the question is what it was asked for at that moment, and this answers it.
+//
+// The pointer lives in a table that CrySystem fills lazily from RVA 0x0369E0. That function
+// takes no arguments (the call at 0x0A2246 sets none), so calling it ourselves first is safe
+// and leaves the table populated, after which the entry can be swapped without racing anyone.
+//
+// This is also the shape of the eventual fix: the same swap, with an allocator of our own on
+// the other side instead of a passthrough.
+#define CRT_TABLE_INIT_RVA 0x0369E0
+#define CRYMALLOC_PTR_RVA  0x6EF6A8
+#define BIG_ALLOC_INTEREST (16 * 1024)
+
+typedef void  (*CrtTableInitFn)(void);
+typedef void* (*CryMallocFn)(size_t size, size_t* allocated);
+
+static CryMallocFn   g_origCryMalloc = 0;
+static volatile long g_allocLogged = 0;
+
+static void* ProxyCryMalloc(size_t size, size_t* allocated)
+{
+	// Note the request before making it. A call that fails by never returning - because the
+	// allocator raises a fatal error of its own - is otherwise invisible.
+	if (size >= BIG_ALLOC_INTEREST && g_allocLogged < 200)
+	{
+		char ask[96];
+		int m = sprintf(ask, "  ask   %9u bytes ...%s", (unsigned)size, "\n");
+		AppendFaultLog(ask, (unsigned long)m);
+	}
+
+	void* p = g_origCryMalloc(size, allocated);
+
+	// Only the interesting ones: every failure, and the large blocks the pools are made of.
+	// Small allocations run into the millions and would drown the log.
+	if ((!p || size >= BIG_ALLOC_INTEREST) && g_allocLogged < 200)
+	{
+		InterlockedIncrement(&g_allocLogged);
+		char line[160];
+		int n = sprintf(line, "  alloc %9u bytes -> 0x%016llX%s%s",
+		                (unsigned)size, (unsigned long long)(ULONG_PTR)p,
+		                p ? ((ULONG_PTR)p >= (ULONG_PTR)0x100000000 ? "   ABOVE 4GB" : "") : "   FAILED",
+		                "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+	return p;
+}
+
+// How much contiguous address space is actually left below the 4 GB line. The engine's pools
+// need single blocks of up to 14 MB, so this is the number that decides whether startup
+// succeeds, and it is invisible from anywhere else.
+static size_t LargestFreeBlockBelow4GB(size_t* totalFreeOut)
+{
+	const ULONG_PTR limit = (ULONG_PTR)0x100000000;
+	size_t largest = 0, total = 0;
+	ULONG_PTR a = 0x10000;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	while (a < limit && VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) == sizeof(mbi))
+	{
+		ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+		if (mbi.State == MEM_FREE)
+		{
+			SIZE_T sz = mbi.RegionSize;
+			if ((ULONG_PTR)mbi.BaseAddress + sz > limit)
+				sz = (SIZE_T)(limit - (ULONG_PTR)mbi.BaseAddress);
+			total += sz;
+			if (sz > largest) largest = sz;
+		}
+		if (next <= a) break;
+		a = next;
+	}
+	if (totalFreeOut) *totalFreeOut = total;
+	return largest;
+}
+
+static const char* InstallAllocProxy(void)
+{
+	HMODULE cs = GetModuleHandleA("CrySystem.dll");
+	if (!cs) return "CrySystem not loaded";
+	unsigned char* base = (unsigned char*)cs;
+
+	// Populate the table first, so the entry we read is the real one.
+	((CrtTableInitFn)(base + CRT_TABLE_INIT_RVA))();
+
+	CryMallocFn* slot = (CryMallocFn*)(base + CRYMALLOC_PTR_RVA);
+	if (!*slot) return "allocator pointer still empty";
+	if (*slot == ProxyCryMalloc) return "already installed";
+
+	g_origCryMalloc = *slot;
+
+	DWORD oldProt = 0;
+	if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProt)) return "VirtualProtect failed";
+	*slot = ProxyCryMalloc;
+	VirtualProtect(slot, sizeof(*slot), oldProt, &oldProt);
+	return "installed";
+}
+
+// Site 1 - the head of the allocator's free-page list, widened in place.
+//
+//     mov [rsp+40h], rax
+//     mov rax, [rsp+40h]     <- reloads what was just stored, and the next instruction
+//                               (lea rax, [rbp+80000h]) overwrites rax regardless
+//     mov [rip+...], ebp     <- 32-bit store of a 64-bit pointer
+//
+// The reload is dead, so padding it out frees the byte the REX.W prefix needs. The store still
+// ends at the same address, so its displacement stays correct.
+#define SITE1_RVA 0x0A1A3F
+static const unsigned char kSite1Expect[] = {
+	0x48, 0x89, 0x44, 0x24, 0x40,
+	0x48, 0x8B, 0x44, 0x24, 0x40
+};
+static const unsigned char kSite1Patched[] = {
+	0x48, 0x89, 0x44, 0x24, 0x40,
+	0x90, 0x90, 0x90, 0x90, 0x48
+};
+
+static bool WriteBytes(unsigned char* at, const unsigned char* src, unsigned long len)
+{
+	DWORD oldProt = 0;
+	if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+	memcpy(at, src, len);
+	VirtualProtect(at, len, oldProt, &oldProt);
+	FlushInstructionCache(GetCurrentProcess(), at, len);
+	return true;
+}
+
+// Applies the pointer-width correction described above. Only the one proven site is here.
+//
+// Other candidates were found by scanning for globals written 32 bits wide and read 64, and
+// three of them were patched through a code cave at one point. That was a mistake: the scan
+// also finds ordinary 32-bit fields the compiler reads in pairs, widening one of those corrupts
+// a value that was never a pointer, and applying them together broke startup on a machine where
+// it had been working. They are not kept behind a flag either - a switch that breaks the game is
+// not a feature. If they are ever needed, the reasoning and the addresses are in docs/FINDINGS.md.
+static const char* PatchSlabPointerWidth(void)
+{
+	HMODULE cs = GetModuleHandleA("CrySystem.dll");
+	if (!cs) return "CrySystem not loaded";
+
+	unsigned char* at = (unsigned char*)cs + SITE1_RVA;
+	if (memcmp(at, kSite1Patched, sizeof(kSite1Patched)) == 0) return "already applied";
+	if (memcmp(at, kSite1Expect, sizeof(kSite1Expect)) != 0) return "did not match this engine build";
+	return WriteBytes(at, kSite1Patched, sizeof(kSite1Patched)) ? "applied" : "write failed";
+}
+
+// Reserves every free region below the 4 GB line, which forces the engine's heap above it.
+//
+// This makes the failure above reproducible on demand instead of waiting for a machine whose
+// address space happens to be laid out badly. Without the patch this reliably reproduces the
+// startup box; with it, startup should be unaffected. Diagnostic use only: -forcehighheap.
+static size_t ReserveLowAddressSpace(void)
+{
+	const ULONG_PTR limit = (ULONG_PTR)0x100000000;
+	size_t reserved = 0;
+	ULONG_PTR a = 0x10000;
+	MEMORY_BASIC_INFORMATION mbi;
+
+	while (a < limit && VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) == sizeof(mbi))
+	{
+		ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+		if (mbi.State == MEM_FREE)
+		{
+			SIZE_T sz = mbi.RegionSize;
+			if ((ULONG_PTR)mbi.BaseAddress + sz > limit)
+				sz = (SIZE_T)(limit - (ULONG_PTR)mbi.BaseAddress);
+			if (VirtualAlloc(mbi.BaseAddress, sz, MEM_RESERVE, PAGE_NOACCESS))
+				reserved += sz;
+		}
+		if (next <= a) break;
+		a = next;
+	}
+	return reserved;
+}
+
+static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderless,
+                            const char* slabFix, size_t lowReserved, const char* allocTrace)
 {
 	FILE* f = fopen("launcher_diag.txt", "w");
 	if (!f) return;
@@ -314,6 +647,17 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 	DiagLine(f, "command line   : %s", (cmdLine && *cmdLine) ? cmdLine : "(none)");
 	DiagLine(f, "timer 1ms      : %s", timerRaised ? "raised OK" : "FAILED (expect ~64 fps cap)");
 	DiagLine(f, "borderless     : %s", borderless ? "enabled" : "disabled (-noborderless)");
+	DiagLine(f, "engine fix     : %s", slabFix);
+	DiagLine(f, "alloc trace    : %s", allocTrace);
+	{
+		size_t totalFree = 0;
+		const size_t largest = LargestFreeBlockBelow4GB(&totalFree);
+		DiagLine(f, "low address sp : %u MB free, largest single block %u MB",
+		         (unsigned)(totalFree / (1024 * 1024)), (unsigned)(largest / (1024 * 1024)));
+	}
+	if (lowReserved)
+		DiagLine(f, "low space      : %u MB reserved (-forcehighheap, diagnostic)",
+		         (unsigned)(lowReserved / (1024 * 1024)));
 	DiagLine(f, "");
 
 	// Install path, write access, locale and free space: environment differences that hardware
@@ -507,16 +851,60 @@ static void WriteDiagReport(const char* cmdLine, bool timerRaised, bool borderle
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
+	// Starting a second copy by accident is easy and confusing: both instances run, both eat
+	// their ~650 MB, and both write to the same Game.log, which makes any later bug report
+	// unreadable. The original launcher asked the same question. -allowmultiple skips it.
+	{
+		HANDLE once = CreateMutexA(NULL, FALSE, "crysis2-64bit-launcher");
+		if (once && GetLastError() == ERROR_ALREADY_EXISTS &&
+		    !(lpCmdLine && strstr(lpCmdLine, "-allowmultiple")))
+		{
+			if (MessageBoxA(NULL, "Crysis 2 is already running.\n\nStart another copy anyway?",
+			                "crysis2-64bit", MB_YESNO | MB_ICONQUESTION) != IDYES)
+				return 0;
+		}
+	}
+
 	// Before engine init: 15.625 ms -> 1 ms (see the note above timeBeginPeriod).
+#ifndef NO_TIMER_LOAD
 	LoadTimerApi();
+#endif
 	const bool timerRaised = (g_timeBeginPeriod && g_timeBeginPeriod(1) == 0);
 
+	// CrySystem stores one allocator pointer with a 32-bit write while every read of it is
+	// 64-bit, so the top half is dropped (see PatchSlabPointerWidth). The bug is real, but it
+	// only bites if an allocation lands above the 4 GB line, and in practice none does: the
+	// process is built against msvcr90, whose heap stays low. Verified by forcing the heap up
+	// with -forcehighheap, which startup survives either way. So the engine is left alone
+	// unless asked: -enginefix applies the correction.
+	const char* slabFix = (lpCmdLine && strstr(lpCmdLine, "-enginefix"))
+	                    ? PatchSlabPointerWidth()
+	                    : "off (engine untouched)";
+
+	// Diagnostic: watch what the engine asks the allocator for, and what it gets back.
+	const char* allocTrace = (lpCmdLine && strstr(lpCmdLine, "-traceallocs"))
+	                       ? InstallAllocProxy() : "off";
+
+	// Diagnostic: force the heap above the 4 GB line to reproduce the failure on demand.
+	size_t lowReserved = 0;
+	if (lpCmdLine && strstr(lpCmdLine, "-forcehighheap"))
+		lowReserved = ReserveLowAddressSpace();
+
 	SetCwdToGameRoot();
+
+#ifndef NO_DETECTOR
+	// Watch for pointers that lost their top half. Observes only; see TruncationVEH.
+	AddVectoredExceptionHandler(1, TruncationVEH);
+#endif
 
 	SSystemInitParams startupParams;
 	startupParams.hInstance = GetModuleHandleA(NULL);
 	startupParams.sLogFileName = "Game.log";
-	strncpy(startupParams.szSystemCmdLine, lpCmdLine ? lpCmdLine : "", sizeof(startupParams.szSystemCmdLine) - 1);
+	// The engine applies the console commands on this line in order, so ours go first and the
+	// player's own command line goes last. That way anything they pass wins over a default of
+	// ours, and a "+map <level>" of theirs is not stranded behind our CVars - which is exactly
+	// what happened when the order was the other way round.
+	startupParams.szSystemCmdLine[0] = 0;
 
 	// Borderless is the default; -noborderless restores the previous behaviour.
 	const bool wantBorderless = !(lpCmdLine && strstr(lpCmdLine, "-noborderless"));
@@ -552,13 +940,30 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		        sizeof(startupParams.szSystemCmdLine) - strlen(startupParams.szSystemCmdLine) - 1);
 	}
 
+	// The player's own arguments, last so they take precedence.
+	if (lpCmdLine && *lpCmdLine)
+	{
+		strncat(startupParams.szSystemCmdLine, " ",
+		        sizeof(startupParams.szSystemCmdLine) - strlen(startupParams.szSystemCmdLine) - 1);
+		strncat(startupParams.szSystemCmdLine, lpCmdLine,
+		        sizeof(startupParams.szSystemCmdLine) - strlen(startupParams.szSystemCmdLine) - 1);
+	}
+
 	// Write the report before engine init, so the file survives a crash during startup and the
 	// tester still has something to send.
-	WriteDiagReport(lpCmdLine, timerRaised, wantBorderless);
+#ifndef NO_DIAG
+	WriteDiagReport(lpCmdLine, timerRaised, wantBorderless, slabFix, lowReserved, allocTrace);
+#endif
 
 	// Bring up the engine's memory system first, in the same order the editor does.
 	ISystem* pSystem = CreateSystemInterface(startupParams);
 	if (!pSystem) { MessageBoxA(0, "CreateSystemInterface failed (engine init)!", "Launcher", MB_OK); return 0; }
+
+	// Hand the ready system to the game DLL, which reuses it instead of building a second one
+	// (ISystem.h: pSystem is "reused if not NULL"). Without this the game brings up its own
+	// CSystem on top of ours, and the second one fails while allocating the pak heap pools -
+	// which is the "Failed CMTSafeHeap::m_pBigPool allocation" box.
+	startupParams.pSystem = pSystem;
 	// Defuse the CryAction release asserts on the CLevelSystem::LoadLevel path: in the Bin64
 	// build they force a crash. Addresses come from the open-source c2-launcher (CryAction
 	// 1.1.1.217). CryAction is loaded explicitly so the patch is in place before the game
