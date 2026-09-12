@@ -1699,6 +1699,17 @@ static int g_passCount = 0;
 typedef USHORT (WINAPI *PFN_CapStack)(ULONG, ULONG, PVOID*, PULONG);
 static PFN_CapStack g_capStack = 0;
 
+static void ReportAllocatorHeads(void);
+static int  CheckAllocatorIntegrity(void);
+static const char* WhyNotSafeForHighMemory(void);
+static bool g_engineFixFailed = false;
+
+// State of the self-check, declared here because the watching thread is defined above the
+// module tables the check reads.
+static volatile LONG g_integrityBad  = 0;
+static volatile LONG g_integrityRuns = 0;
+static bool          g_integrityTripped = false;
+
 static volatile LONG g_sampleCount = 0;
 
 // Everything the hook sees, before any filter at all. The counters that follow all narrow the
@@ -2872,20 +2883,55 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		// this launcher causes or something the game does anyway.
 		WatchNewSlabs(elapsed);
 
+		// The correction, watched rather than assumed. Only meaningful once memory is actually
+		// being placed high - below 4 GB a lost upper half is harmless and proves nothing.
+		if (g_topDown && !g_integrityTripped && (i % 2) == 1)
+		{
+			if (CheckAllocatorIntegrity() > 0)
+			{
+				g_integrityTripped = true;
+				g_topDown = false;          // stop placing memory high, right now
+
+				int m = sprintf(line, "  INTEGRITY: a pointer lost its upper half - high memory "
+				                "switched off after %ld check(s). The game keeps running on what "
+				                "it already has%s", g_integrityRuns, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+			}
+		}
+
 		// The ceiling, watched for rather than waited for.
-		if (g_lowGuardOn && !g_topDown && (i % 2) == 0)
+		if (g_lowGuardOn && !g_topDown && !g_integrityTripped && (i % 2) == 0)
 		{
 			const unsigned long long freeMb = FreeBelow4GB();
 			if (freeMb < (unsigned long long)g_lowGuardMb)
 			{
-				g_topDown = true;
-				g_guardFired = true;
-				HookTopDownEverywhere();
+				const char* notReady = WhyNotSafeForHighMemory();
+				if (notReady)
+				{
+					// Room is running out and the one thing that makes high memory survivable
+					// is not in place. Going high here would trade a possible crash later for
+					// a certain one now, so the guard stays out of it and says why - once.
+					static bool said = false;
+					if (!said)
+					{
+						said = true;
+						int m = sprintf(line, "  lowguard: %llu MB free below 4 GB, but %s - "
+						                "staying low, this build is not corrected%s",
+						                freeMb, notReady, "\n");
+						AppendFaultLog(line, (unsigned long)m);
+					}
+				}
+				else
+				{
+					g_topDown = true;
+					g_guardFired = true;
+					HookTopDownEverywhere();
 
-				int m = sprintf(line, "  lowguard: %llu MB free below 4 GB, under the %u MB "
-				                "mark - new allocations go high from here%s",
-				                freeMb, (unsigned)g_lowGuardMb, "\n");
-				AppendFaultLog(line, (unsigned long)m);
+					int m = sprintf(line, "  lowguard: %llu MB free below 4 GB, under the %u MB "
+					                "mark - corrections verified, new allocations go high%s",
+					                freeMb, (unsigned)g_lowGuardMb, "\n");
+					AppendFaultLog(line, (unsigned long)m);
+				}
 			}
 			else if (elapsed % 300 == 0)
 			{
@@ -3045,6 +3091,8 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 					AppendFaultLog(line, (unsigned long)s);
 				}
 			}
+
+			ReportAllocatorHeads();   // declared above, defined with the module tables
 
 			if (g_heapHigh)
 			{
@@ -3279,7 +3327,14 @@ static const char* WidenStore(unsigned char* base, const WidenSite* s, unsigned 
 	if (s->bytes[0] >= 0x40 && s->bytes[0] <= 0x4F)
 	{
 		const unsigned char rex = (unsigned char)(s->bytes[0] | 0x08);
-		return WriteBytes(at, &rex, 1) ? 0 : "write failed";
+		if (!WriteBytes(at, &rex, 1)) return "write failed";
+
+		// Read it back. WriteBytes can report success while something else - another patcher,
+		// a protection layer, a copy-on-write page that went somewhere else - leaves the
+		// original byte in place, and a correction that is not there is worse than none:
+		// we would go on to place memory high on the strength of it.
+		if (*at != rex) return "write did not stick";
+		return 0;
 	}
 
 	// The list walk: "mov eax, [reg]" reads the next block's address with half of it missing,
@@ -3639,7 +3694,118 @@ static const struct { const char* name; const WidenSite* sites; unsigned count; 
 	{ "CryRenderD3D9.dll",  kR9Sites,  8 },
 };
 
-static volatile LONG g_widened[3] = { 0, 0, 0 };
+static volatile LONG g_widened[3] = { 0, 0, 0 };   // an attempt was made
+static volatile LONG g_widenOk[3]  = { 0, 0, 0 };   // every site in the module took
+static volatile LONG g_luaOk       = 0;
+
+// Is the copy inside this module actually in use, and is the correction holding?
+//
+// Two questions in one reading. A head that is not null means this module's own copy of the
+// allocator is serving allocations - it is not routing everything through CrySystem's CryMalloc.
+// A head above 4 GB means the widened store kept the upper half: that is the correction working,
+// observed in the engine's own data rather than inferred from a counter of ours.
+// Does the correction still hold, judged from the engine's own data?
+//
+// Every non-empty head in these lists is a pointer to a free block inside a page the allocator
+// owns, so it must be readable. A head that cannot be read is a pointer that lost its upper
+// half - the exact failure this whole effort exists to prevent - and it means memory is being
+// placed high while something up the chain is still storing 32 bits of it.
+//
+// Finding one is not a reason to log and carry on. It is a reason to stop placing memory high
+// at once: what is already allocated keeps working, and the damage stops growing.
+// May memory be placed high yet?
+//
+// The question is not "did we try" but "is every module that is loaded right now actually
+// corrected". A module whose allocator still stores 32 bits of a pointer dies within seconds of
+// the first high allocation - measured: with -nomodfix and high memory, CrySoundSystem faults
+// at +0x12E68 before the level finishes loading, which is far too fast for any watchdog to
+// catch. So the decision has to be made before the first high byte, not after.
+//
+// Returns 0 when it is safe, or the name of what is not ready.
+static const char* WhyNotSafeForHighMemory(void)
+{
+	if (g_engineFixFailed) return "CrySystem allocator not corrected";
+
+	for (int i = 0; i < 3; i++)
+		if (GetModuleHandleA(kWidenWork[i].name) && !g_widenOk[i])
+			return kWidenWork[i].name;
+
+	if (GetModuleHandleA("CryScriptSystem.dll") && !g_luaOk)
+		return "CryScriptSystem.dll";
+
+	return 0;
+}
+
+static int CheckAllocatorIntegrity(void)
+{
+	int bad = 0;
+
+	for (int i = 0; i < 3; i++)
+	{
+		HMODULE m = GetModuleHandleA(kWidenWork[i].name);
+		if (!m) continue;
+
+		const unsigned rva = HeadsRvaFor(kWidenWork[i].name);
+		if (!rva) continue;
+
+		const ULONG_PTR* heads = (const ULONG_PTR*)((unsigned char*)m + rva);
+		for (unsigned k = 0; k < 32; k++)
+		{
+			ULONG_PTR head = 0;
+			if (!SafePeek(&heads[k], &head)) break;
+			if (!head) continue;
+
+			// A truncated pointer is a small number that happens to be left over from the
+			// lower half, so it is both unaligned-looking and unreadable more often than not.
+			ULONG_PTR first = 0;
+			if (!SafePeek((const void*)head, &first))
+			{
+				bad++;
+				if (bad <= 3)
+				{
+					char line[200];
+					int n = sprintf(line, "  INTEGRITY: %s list %u points at 0x%llX, "
+					                "which cannot be read%s",
+					                kWidenWork[i].name, k,
+					                (unsigned long long)head, "\n");
+					AppendFaultLog(line, (unsigned long)n);
+				}
+			}
+		}
+	}
+
+	InterlockedIncrement(&g_integrityRuns);
+	if (bad) InterlockedExchangeAdd(&g_integrityBad, bad);
+	return bad;
+}
+
+static void ReportAllocatorHeads(void)
+{
+	for (int i = 0; i < 3; i++)
+	{
+		HMODULE m = GetModuleHandleA(kWidenWork[i].name);
+		if (!m) continue;
+
+		const unsigned rva = HeadsRvaFor(kWidenWork[i].name);
+		if (!rva) continue;
+
+		const ULONG_PTR* heads = (const ULONG_PTR*)((unsigned char*)m + rva);
+		unsigned used = 0, high = 0;
+		for (unsigned k = 0; k < 32; k++)
+		{
+			ULONG_PTR v = 0;
+			if (!SafePeek(&heads[k], &v)) break;
+			if (!v) continue;
+			used++;
+			if ((unsigned long long)v > 0xFFFFFFFFull) high++;
+		}
+
+		char line[200];
+		int n = sprintf(line, "  heads: %s %u of 32 lists in use, %u of them above 4 GB%s",
+		                kWidenWork[i].name, used, high, "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+}
 static volatile LONG g_luaWidened = 0;
 
 static void WidenLuaOnce(void)
@@ -3647,6 +3813,7 @@ static void WidenLuaOnce(void)
 	if (InterlockedCompareExchange(&g_luaWidened, 1, 0) != 0) return;
 
 	const char* r = PatchLuaPool();
+	if (strstr(r, "all ")) InterlockedExchange(&g_luaOk, 1);
 	char line[192];
 	int n = sprintf(line, "  modfix: CryScriptSystem.dll: %s%s", r, "\n");
 	AppendFaultLog(line, (unsigned long)n);
@@ -3660,6 +3827,12 @@ static void WidenIfNeeded(int i)
 	if (!GetModuleHandleA(kWidenWork[i].name)) { g_widened[i] = 0; return; }
 
 	const char* r = WidenModule(kWidenWork[i].name, kWidenWork[i].sites, kWidenWork[i].count);
+
+	// "all N widened" is the only result that lets memory go high later. Anything else - one
+	// site that did not match, a write that did not stick - leaves this module's allocator
+	// storing 32 bits of a 64-bit pointer, and high memory would kill it in seconds.
+	if (strstr(r, "all ")) InterlockedExchange(&g_widenOk[i], 1);
+
 	char line[224];
 	int n = sprintf(line, "  modfix: %s%s", r, "\n");
 	AppendFaultLog(line, (unsigned long)n);
@@ -5038,6 +5211,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	const char* slabFix = (lpCmdLine && strstr(lpCmdLine, "-noenginefix"))
 	                    ? "off (engine untouched)"
 	                    : PatchSlabPointerWidth();
+
+	// The gate below reads this: without CrySystem's own eight sites, nothing else matters.
+	// A partial result reads as a failure here on purpose: "applied" somewhere in the line is
+	// not the same as every site applied, and the gate errs toward staying low.
+	g_engineFixFailed = strstr(slabFix, "off") || strstr(slabFix, "not ") ||
+	                    strstr(slabFix, "failed") || strstr(slabFix, "no match") ||
+	                    !strstr(slabFix, "applied");
 
 	// Diagnostic: watch what the engine asks the allocator for, and what it gets back.
 	const char* allocTrace = (lpCmdLine && strstr(lpCmdLine, "-traceallocs"))
