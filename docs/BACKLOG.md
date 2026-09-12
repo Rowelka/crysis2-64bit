@@ -96,6 +96,16 @@ Ruled out so far:
 So the effects are not failing, they are not being created, and nothing is logged when that
 happens. A silent refusal. Next step is tracing the creation path rather than guessing again.
 
+12.09: two things worth trying before that trace. Every level log carries the line
+
+    Allocate render buffer for particles (16384 verts, 32768 tris)
+
+which is room for about four thousand particles on screen at once - and the engine draws debris,
+smoke and tracers from the same buffer. The pools behind it come from the console build too:
+`e_ParticlesPoolSize` and `e_ParticlesEmitterPoolSize`. A pool with no free emitter left would
+refuse to create an effect exactly like this: silently. `bigpools.cfg` raises both, so the test
+is one run with `+exec bigpools.cfg` and a look at whether tracers come back.
+
 ### Does the pointer truncation actually matter
 
 **Answered, 12.09.2026: yes, and there was far more of it than one site.**

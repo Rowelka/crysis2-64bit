@@ -393,6 +393,47 @@ files). Comparing pak sizes settles that in seconds instead of a debugging sessi
 Nothing user-identifying is collected: no user name, no profile paths, no serials, no network
 information.
 
+## Testing without playing
+
+Catching a crash by hand costs an evening: the game has to be played until it dies, and the
+interesting ones only show up after an hour. Two scripts do it instead.
+
+`soak.ps1` runs levels on its own - it waits for the level to finish loading, moves the player so
+the AI and the renderer are not idling at a spawn point, and collects what the launcher recorded
+for each level into one table.
+
+```
+.\soak.ps1                                     the campaign, 17 levels, two minutes each
+.\soak.ps1 -Levels TimesSquare -Sec 60         one level
+.\soak.ps1 -Extra "-topdown -modfix"           with flags
+.\soak.ps1 -KeepGoing                          do not stop at the first crash
+```
+
+It never deletes a log. An earlier version cleared `Game.log` before each run "to keep things
+tidy" and threw away the record of a full campaign playthrough, which was the one thing that
+could not be reproduced.
+
+A full campaign run with the corrections on, for reference:
+
+```
+Level          Status LoadSec PlaySec AVs
+TimesSquare    ok          23      71   0
+Downtown       ok          25      71   0
+CentralStation ok          24      71   0
+...
+```
+
+`memmap.ps1` answers the other question - whether a running build is really using 64-bit memory:
+
+```
+private below 4 GB :   1645 MB
+private above 4 GB :    622 MB
+                         27% of private memory is high
+```
+
+Without `-topdown` that second number is zero, on every level: the 64-bit build never put a
+single byte above the 4 GB line on its own.
+
 ## Credits
 
 - **[c1-launcher](https://github.com/ccomrade/c1-launcher)** by *ccomrade* - the original

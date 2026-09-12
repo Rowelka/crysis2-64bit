@@ -2857,61 +2857,6 @@ static unsigned g_lowFailed  = 0;      // reservations that failed
 static unsigned g_lowLastErr = 0;      // GetLastError of the last failure
 static size_t   g_lowLeft    = 0;      // small blocks left free on purpose
 
-// Pushes the engine's own large allocations above the 4 GB line.
-//
-// This replaces -forcehighheap as the way to test the pointer corrections. Reserving all the low
-// address space does move the heap up, but it also takes that space away from the renderer,
-// which maps its resources there - the game then stops during "Init textures management" whether
-// the pointers are corrected or not, so it measures nothing.
-//
-// Here only CrySystem's own VirtualAlloc calls are intercepted, and only the large ones: the
-// allocator's slab lands above the line while everything else, the renderer included, keeps
-// getting memory where it always did. If the engine runs with its slab up there, the truncation
-// really is gone rather than merely dormant.
-// Redirects one imported function of a loaded module to a replacement, returning the original.
-static bool HookImport(HMODULE mod, const char* dll, const char* func, void* repl, void** orig)
-{
-	unsigned char* base = (unsigned char*)mod;
-	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
-	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-	const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
-	if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-	const IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-	if (!dir->VirtualAddress) return false;
-
-	const IMAGE_IMPORT_DESCRIPTOR* imp = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dir->VirtualAddress);
-	for (; imp->Name; imp++)
-	{
-		const char* name = (const char*)(base + imp->Name);
-		if (_stricmp(name, dll) != 0) continue;
-
-		// OriginalFirstThunk keeps the names, FirstThunk the addresses the code actually calls.
-		const IMAGE_THUNK_DATA64* names =
-			(const IMAGE_THUNK_DATA64*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk
-			                                                            : imp->FirstThunk));
-		IMAGE_THUNK_DATA64* addrs = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
-
-		for (; names->u1.AddressOfData; names++, addrs++)
-		{
-			if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
-			const IMAGE_IMPORT_BY_NAME* byName =
-				(const IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
-			if (strcmp((const char*)byName->Name, func) != 0) continue;
-
-			DWORD old = 0;
-			if (!VirtualProtect(&addrs->u1.Function, sizeof(ULONGLONG), PAGE_READWRITE, &old))
-				return false;
-			if (orig) *orig = (void*)(ULONG_PTR)addrs->u1.Function;
-			addrs->u1.Function = (ULONGLONG)(ULONG_PTR)repl;
-			VirtualProtect(&addrs->u1.Function, sizeof(ULONGLONG), old, &old);
-			return true;
-		}
-	}
-	return false;
-}
-
-
 // Takes the large free blocks below the 4 GB line and leaves the small ones alone.
 //
 // Taking everything does not work: the engine then cannot start at all - it dies in five
