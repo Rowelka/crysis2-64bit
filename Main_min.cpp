@@ -1660,6 +1660,23 @@ static int g_passCount = 0;
 typedef USHORT (WINAPI *PFN_CapStack)(ULONG, ULONG, PVOID*, PULONG);
 static PFN_CapStack g_capStack = 0;
 
+static volatile LONG g_sampleCount = 0;
+
+static void SampleCall(PVOID* base, SIZE_T bytes, ULONG type)
+{
+	if (bytes < 1024 * 1024) return;
+	if (InterlockedIncrement(&g_sampleCount) > 10) return;
+
+	char line[200];
+	int n = sprintf(line, "  sample: %llu KB, base 0x%llX, type 0x%lX%s%s%s%s",
+	                (unsigned long long)(bytes / 1024),
+	                (unsigned long long)(ULONG_PTR)*base, type,
+	                (type & MEM_RESERVE) ? " reserve" : "",
+	                (type & MEM_COMMIT) ? " commit" : "",
+	                (type & MEM_TOP_DOWN) ? " topdown" : "", "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
 static void AttributeCall(SIZE_T bytes, bool high)
 {
 	if (!g_capStack || bytes < 256 * 1024) return;
@@ -1910,10 +1927,27 @@ static LONG TryHighAt(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size
 {
 	const SIZE_T want = *size;
 
+	// Asking for a particular address turns "commit" into "reserve and commit": the region does
+	// not exist yet, and a bare commit would fail on it.
+	type |= MEM_RESERVE;
+
+	// One step past the end of what was asked for, rounded up to the 64 KB granularity, plus a
+	// gap. A flat 64 MB was fine for ninety reservations a level and would run through the whole
+	// 256 GB in one level now that every large malloc comes this way.
+	LONGLONG step = (LONGLONG)((want + 0x1FFFF) & ~(SIZE_T)0xFFFF);
+	if (step < 0x100000LL) step = 0x100000LL;
+
 	for (int attempt = 0; attempt < 24; attempt++)
 	{
-		const LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, 0x4000000LL);  // 64 MB apart
-		if (at > 0x4000000000LL) return -1;                                        // past 256 GB
+		LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, step);
+		if (at > 0x4000000000LL)                                       // past 256 GB
+		{
+			// Wrap rather than give up: what was freed along the way has left gaps, and the
+			// next pass over the range finds them.
+			InterlockedExchange64(&g_highCursor, 0x200000000LL);
+			at = InterlockedExchangeAdd64(&g_highCursor, step);
+			if (at > 0x4000000000LL) return -1;
+		}
 
 		PVOID p = (PVOID)(ULONG_PTR)at;
 		SIZE_T sz = want;
@@ -1932,12 +1966,14 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
                                      SIZE_T* size, ULONG type, ULONG protect)
 {
 	const bool steer = base && (*base == NULL) && size && (*size >= g_topDownMin) &&
-	                   ((type & MEM_RESERVE) != 0) && (proc == (HANDLE)(LONG_PTR)-1);
+	                   ((type & (MEM_RESERVE | MEM_COMMIT)) != 0) &&
+	                   (proc == (HANDLE)(LONG_PTR)-1);
 
 	if (!steer && g_topDown && base && size && proc == (HANDLE)(LONG_PTR)-1)
 	{
 		const LONGLONG kb = (LONGLONG)(*size / 1024);
 		AttributeCall(*size, (unsigned long long)(ULONG_PTR)*base > 0xFFFFFFFFull);
+		SampleCall(base, *size, type);
 		if (*base != NULL)
 		{
 			InterlockedIncrement(&g_skipFixedAddr);
