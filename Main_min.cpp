@@ -2613,6 +2613,104 @@ static const char* HookNtAlloc(void)
 	return "applied";
 }
 
+// -memstress:GB - the examination this whole effort is for.
+//
+// Everything until now measured where memory landed. This asks the question the mod work
+// actually depends on: can the engine's own allocator hand out gigabytes, above the 4 GB line,
+// and give back what was written into them. A truncated pointer cannot survive this - the block
+// would be handed out at one address and read back at another, and the pattern would not match.
+//
+// The blocks come from CryMalloc, the retail bucket allocator, the one with eight truncating
+// stores in every module. Every page is written and every page is checked, so this is real
+// memory in use, not reserved address space.
+typedef void* (__cdecl *PFN_CryMalloc)(size_t, size_t*, size_t);
+typedef void  (__cdecl *PFN_CryFree)(void*, size_t);
+
+static unsigned g_stressGb = 0;
+
+#define STRESS_BLOCK (4 * 1024 * 1024)
+#define STRESS_MAX   4096
+
+static unsigned long long StressPattern(unsigned long long addr, unsigned long long off)
+{
+	return (addr ^ (off * 0x9E3779B97F4A7C15ULL)) + 0x5851F42D4C957F2DULL;
+}
+
+static void RunMemoryStress(void)
+{
+	HMODULE sys = GetModuleHandleA("CrySystem.dll");
+	if (!sys) { AppendFaultLog("  memstress: CrySystem not loaded\n", 36); return; }
+
+	PFN_CryMalloc cryMalloc = (PFN_CryMalloc)GetProcAddress(sys, "CryMalloc");
+	PFN_CryFree   cryFree   = (PFN_CryFree)GetProcAddress(sys, "CryFree");
+	if (!cryMalloc || !cryFree)
+	{
+		AppendFaultLog("  memstress: CryMalloc/CryFree not exported\n", 44);
+		return;
+	}
+
+	void** blocks = (void**)VirtualAlloc(NULL, STRESS_MAX * sizeof(void*),
+	                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (!blocks) return;
+
+	const unsigned want = (g_stressGb * 1024) / (STRESS_BLOCK / (1024 * 1024));
+	unsigned got = 0, high = 0;
+	unsigned long long bytes = 0;
+	const DWORD started = GetTickCount();
+
+	char line[224];
+	int n = sprintf(line, "  memstress: asking the engine's allocator for %u GB in %u MB "
+	                "blocks%s", g_stressGb, (unsigned)(STRESS_BLOCK / (1024 * 1024)), "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	for (unsigned i = 0; i < want && i < STRESS_MAX; i++)
+	{
+		size_t allocated = 0;
+		void* p = cryMalloc(STRESS_BLOCK, &allocated, 16);
+		if (!p) break;
+
+		blocks[got++] = p;
+		bytes += STRESS_BLOCK;
+		if ((unsigned long long)(ULONG_PTR)p > 0xFFFFFFFFull) high++;
+
+		// Write every page, so this is memory the machine really has to find.
+		unsigned long long* q = (unsigned long long*)p;
+		for (unsigned long long off = 0; off < STRESS_BLOCK; off += 4096)
+			q[off / 8] = StressPattern((unsigned long long)(ULONG_PTR)p, off);
+	}
+
+	const DWORD wrote = GetTickCount();
+
+	// Read it all back. A pointer that lost its upper half would have written somewhere else.
+	unsigned bad = 0;
+	for (unsigned i = 0; i < got; i++)
+	{
+		const unsigned long long* q = (const unsigned long long*)blocks[i];
+		for (unsigned long long off = 0; off < STRESS_BLOCK; off += 4096)
+			if (q[off / 8] != StressPattern((unsigned long long)(ULONG_PTR)blocks[i], off))
+			{
+				bad++;
+				break;
+			}
+	}
+
+	unsigned long long lo = 0, hi = 0, img = 0;
+	MemoryCensus(&lo, &hi, &img);
+
+	n = sprintf(line, "  memstress: %u of %u blocks (%llu MB), %u above 4 GB, %u corrupted; "
+	            "census now %llu MB low / %llu MB high%s",
+	            got, want, bytes / (1024 * 1024), high, bad, lo, hi, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	for (unsigned i = 0; i < got; i++) cryFree(blocks[i], 16);
+	VirtualFree(blocks, 0, MEM_RELEASE);
+
+	n = sprintf(line, "  memstress: done, %u ms to fill, %u ms in total, and the game is still "
+	            "running%s", (unsigned)(wrote - started), (unsigned)(GetTickCount() - started),
+	            "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
 // Large private regions below 4 GB, noticed the second they appear. Every hook we have says
 // these are not being allocated through it, so the remaining question is when they show up: the
 // launcher's clock and the engine's log share a wall clock, and whatever the engine was doing at
@@ -2707,6 +2805,17 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		// Watched whatever the flags say: the question is whether these regions are something
 		// this launcher causes or something the game does anyway.
 		WatchNewSlabs(elapsed);
+
+		// Late enough that a level is loaded and the engine is doing its normal work.
+		if (g_stressGb && elapsed >= 40)
+		{
+			const unsigned gb = g_stressGb;
+			g_stressGb = 0;
+			const unsigned keep = gb;
+			g_stressGb = keep;
+			RunMemoryStress();
+			g_stressGb = 0;
+		}
 
 		if (g_topDown)
 		{
@@ -4935,6 +5044,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, SoundFixThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
+	}
+
+	// -memstress:GB asks the engine's own allocator for that many gigabytes once a level is up,
+	// writes every page and reads it back. The exam the rest of this was built for.
+	if (lpCmdLine && strstr(lpCmdLine, "-memstress"))
+	{
+		const char* ms = strstr(lpCmdLine, "-memstress:");
+		g_stressGb = ms ? (unsigned)atoi(ms + 11) : 2;
+		if (!g_stressGb || g_stressGb > 16) g_stressGb = 2;
+		StartRangeKeeper();
 	}
 
 	// -topdown[:KB] steers large reservations to the top of the address space, where a lost upper
