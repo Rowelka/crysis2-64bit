@@ -1693,7 +1693,7 @@ static CallerSite g_callers[CALLER_SLOTS];
 // ntdll, kernelbase, kernel32 and this launcher itself are all pass-throughs on the way down:
 // stopping at any of them names the plumbing instead of the caller. The first frame outside all
 // four is the module that actually wanted the memory.
-#define PASS_SLOTS 5
+#define PASS_SLOTS 8
 static unsigned long long g_passLo[PASS_SLOTS], g_passHi[PASS_SLOTS];
 static int g_passCount = 0;
 typedef USHORT (WINAPI *PFN_CapStack)(ULONG, ULONG, PVOID*, PULONG);
@@ -1887,6 +1887,96 @@ static void AttributeCall(SIZE_T bytes, bool high)
 	}
 }
 
+// Memory the display driver asks for is left exactly where the system would have put it.
+//
+// The corrections in this launcher cover the engine's allocator, module by module, byte by byte.
+// The driver is somebody else's code entirely: nothing here has been checked against it, and it
+// is free to pack pointers however it likes. Steering its allocations high is a bet with no
+// evidence behind it - and the cutscene failure is what losing that bet looks like, since a
+// video sequence is exactly the path that runs through the driver.
+#define DRIVER_SLOTS 14   // the driver halves, plus whatever -keeplow adds
+static unsigned long long g_drvLo[DRIVER_SLOTS], g_drvHi[DRIVER_SLOTS];
+static int  g_drvCount = 0;
+static volatile LONG g_drvLeftAlone = 0;
+
+static void NoteDriverModule(HMODULE m)
+{
+	if (!m || g_drvCount >= DRIVER_SLOTS) return;
+	for (int i = 0; i < g_drvCount; i++)
+		if (g_drvLo[i] == (unsigned long long)(ULONG_PTR)m) return;
+
+	__try
+	{
+		const unsigned long long lo = (unsigned long long)(ULONG_PTR)m;
+		const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)m;
+		const IMAGE_NT_HEADERS64* pe =
+			(const IMAGE_NT_HEADERS64*)((const unsigned char*)m + dos->e_lfanew);
+		g_drvLo[g_drvCount] = lo;
+		g_drvHi[g_drvCount] = lo + pe->OptionalHeader.SizeOfImage;
+		g_drvCount++;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// -keeplow:Name, repeatable - memory this module asks for stays where the system would have
+// put it. Written for finding out which module a failure belongs to: high memory breaks the
+// cutscene, so exclude a module, see whether it comes back, and half the suspects are gone.
+// It doubles as the fix if some module turns out to be one we must not touch.
+#define KEEPLOW_SLOTS 8
+static char g_keepLowNames[KEEPLOW_SLOTS][40];
+static int  g_keepLowCount = 0;
+
+static void ParseKeepLow(const char* cmd)
+{
+	const char* at = cmd;
+	while (at && (at = strstr(at, "-keeplow:")) != 0 && g_keepLowCount < KEEPLOW_SLOTS)
+	{
+		at += 9;
+		int n = 0;
+		while (at[n] && at[n] != ' ' && n < 39) n++;
+		memcpy(g_keepLowNames[g_keepLowCount], at, n);
+		g_keepLowNames[g_keepLowCount][n] = 0;
+		g_keepLowCount++;
+		at += n;
+	}
+}
+
+// The user-mode halves of the display driver, by the names they load under.
+static void FindDriverModules(void)
+{
+	static const char* const kDriverNames[] = {
+		"nvwgf2umx.dll", "nvldumdx.dll", "nvoglv64.dll",
+		"amdxx64.dll", "atidxx64.dll", "igd10iumd64.dll",
+	};
+	for (int i = 0; i < (int)(sizeof(kDriverNames) / sizeof(kDriverNames[0])); i++)
+		NoteDriverModule(GetModuleHandleA(kDriverNames[i]));
+
+	// Whatever the command line asked to leave alone, treated the same way.
+	for (int i = 0; i < g_keepLowCount; i++)
+	{
+		char withExt[48];
+		sprintf(withExt, "%s.dll", g_keepLowNames[i]);
+		HMODULE m = GetModuleHandleA(g_keepLowNames[i]);
+		if (!m) m = GetModuleHandleA(withExt);
+		NoteDriverModule(m);
+	}
+}
+
+static bool AskedByDriver(void)
+{
+	if (!g_drvCount || !g_capStack) return false;
+
+	void* frames[14];
+	const USHORT n = g_capStack(1, 14, frames, NULL);
+	for (USHORT i = 0; i < n; i++)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)frames[i];
+		for (int k = 0; k < g_drvCount; k++)
+			if (a >= g_drvLo[k] && a < g_drvHi[k]) return true;
+	}
+	return false;
+}
+
 static void AddPassThrough(HMODULE m)
 {
 	if (!m || g_passCount >= PASS_SLOTS) return;
@@ -1916,6 +2006,25 @@ static void PrepareAttribution(void)
 	AddPassThrough(GetModuleHandleA("kernelbase.dll"));
 	AddPassThrough(GetModuleHandleA("kernel32.dll"));
 	AddPassThrough(GetModuleHandleA(NULL));      // the launcher's own hook is a pass-through too
+
+	// The CRT is plumbing as well: every large allocation the engine makes arrives through
+	// malloc, and stopping at msvcr90 names the pipe instead of whoever poured into it.
+	AddPassThrough(GetModuleHandleA("msvcr90.dll"));
+
+	// And so is the engine's own allocator. CryMalloc lives in CrySystem around 0xA1000 and
+	// every module in the game calls it, so a frame in there names the allocator rather than
+	// whoever wanted the memory. Only that stretch is skipped, not the whole module: plenty of
+	// real callers live elsewhere in CrySystem.
+	{
+		HMODULE cs = GetModuleHandleA("CrySystem.dll");
+		if (cs && g_passCount < PASS_SLOTS)
+		{
+			const unsigned long long base = (unsigned long long)(ULONG_PTR)cs;
+			g_passLo[g_passCount] = base + 0xA0E00;   // CryMalloc's outer wrapper
+			g_passHi[g_passCount] = base + 0xA2000;   // through the bucket allocator
+			g_passCount++;
+		}
+	}
 }
 static unsigned long long g_topDownLowest  = ~0ull;
 
@@ -2415,8 +2524,50 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 	// Every large request as it arrives, before any filter. The census keeps finding 32 MB
 	// pieces below 4 GB that no counter here accounts for; this settles whether they come
 	// through this call at all.
-	const bool bigOne = g_memDebug && size && *size >= 8 * 1024 * 1024 &&
-	                    InterlockedIncrement(&g_bigSeen) <= 60;
+	// 4 MB and up, because that is the band the cutscene failure was narrowed to: high memory
+	// at a 4 MB threshold breaks it, at 16 MB it plays. Whoever asks for a block in between is
+	// the one to look at.
+	const bool bigOne = g_memDebug && size && *size >= 4 * 1024 * 1024 &&
+	                    InterlockedIncrement(&g_bigSeen) <= 80;
+
+	if (bigOne && g_capStack)
+	{
+		void* frames[12];
+		const USHORT n = g_capStack(1, 12, frames, NULL);
+		unsigned long long site = 0;
+		for (USHORT f = 0; f < n; f++)
+		{
+			const unsigned long long a = (unsigned long long)(ULONG_PTR)frames[f];
+			bool through = false;
+			for (int k = 0; k < g_passCount; k++)
+				if (a >= g_passLo[k] && a < g_passHi[k]) { through = true; break; }
+			if (!through) { site = a; break; }
+		}
+
+		char who[96];
+		strcpy(who, "(plumbing only)");
+		if (site)
+		{
+			HMODULE mod = 0;
+			if (GetModuleHandleExA(0x00000004 | 0x00000002, (LPCSTR)(ULONG_PTR)site, &mod) && mod)
+			{
+				char full[MAX_PATH];
+				if (GetModuleFileNameA(mod, full, MAX_PATH))
+				{
+					const char* b = strrchr(full, 0x5C);
+					sprintf(who, "%s+0x%llX", b ? b + 1 : full,
+					        site - (unsigned long long)(ULONG_PTR)mod);
+				}
+				else sprintf(who, "0x%llX", site);
+			}
+			else sprintf(who, "0x%llX (no module)", site);
+		}
+
+		char al[220];
+		int an = sprintf(al, "  asks: %llu MB wanted by %s%s",
+		                 (unsigned long long)(*size / (1024 * 1024)), who, "\n");
+		AppendFaultLog(al, (unsigned long)an);
+	}
 
 	// g_topDown is the switch: off until -topdown says so, or until lowguard sees the low
 	// address space running out. The hook itself is always installed, because it cannot move
@@ -2446,6 +2597,13 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 			InterlockedIncrement(&g_skipTooSmall);
 			InterlockedExchangeAdd64(&g_skipSmallKb, kb);
 		}
+	}
+
+	// Anything sizeable that the driver asked for stays where it would have been.
+	if (steer && *size >= 1024 * 1024 && AskedByDriver())
+	{
+		InterlockedIncrement(&g_drvLeftAlone);
+		return g_origNtAlloc(proc, base, zeroBits, size, type, protect);
 	}
 
 	if (steer && CalledByUnreadyModule())
@@ -2947,6 +3105,8 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		// Watched whatever the flags say: the question is whether these regions are something
 		// this launcher causes or something the game does anyway.
 		WatchNewSlabs(elapsed);
+
+		if (g_topDown && (i % 4) == 0) FindDriverModules();
 
 		// The correction, watched rather than assumed. Only meaningful once memory is actually
 		// being placed high - below 4 GB a lost upper half is harmless and proves nothing.
@@ -5432,6 +5592,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
 		if (strstr(lpCmdLine, "-topmap")) g_topMap = true;
 		if (strstr(lpCmdLine, "-memdebug")) g_memDebug = true;
+		ParseKeepLow(lpCmdLine);
 		PrepareAttribution();
 
 		// -heaphigh[:KB]: large heap blocks out of the process heap entirely. Where the memory
