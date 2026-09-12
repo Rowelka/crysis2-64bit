@@ -1,4 +1,4 @@
-# Plays the campaign without a human and says what happened.
+﻿# Plays the campaign without a human and says what happened.
 #
 # Catching crashes by hand costs an evening per crash: the game has to be played until it dies,
 # and the interesting ones only show up after an hour. This runs the levels on its own, moves the
@@ -13,7 +13,9 @@ param(
     [int]$Sec         = 120,                  # seconds of play per level, after it has loaded
     [int]$LoadTimeout = 240,                  # seconds to wait for a level to finish loading
     [string]$Extra    = "",                   # extra launcher flags
-    [switch]$NoMove,                          # leave the player standing still
+    [switch]$Move,                            # drive the player: walk, look, shoot
+                                              # (off by default - the run must not steal the
+                                              #  keyboard, mouse or focus while someone plays)
     [switch]$KeepGoing                        # do not stop the whole soak on the first crash
 )
 
@@ -142,13 +144,13 @@ foreach ($level in $Levels) {
             # round. Typing W and clicking the mouse into someone else's window is the kind of
             # automation mistake that is hard to undo.
             $p.Refresh()
-            if ([SoakInput]::GetForegroundWindow() -ne $p.MainWindowHandle) {
+            if ($Move -and [SoakInput]::GetForegroundWindow() -ne $p.MainWindowHandle) {
                 [void][SoakInput]::SetForegroundWindow($p.MainWindowHandle)
                 Start-Sleep -Milliseconds 300
                 continue
             }
 
-            if (-not $NoMove) {
+            if ($Move) {
                 # Walk, look around, and shoot now and then. Standing at a spawn point exercises
                 # almost nothing: the AI never acquires a target and the renderer draws one view.
                 switch ($step % 8) {
