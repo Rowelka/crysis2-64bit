@@ -1652,8 +1652,8 @@ static bool              g_memDebug      = false;   // -memdebug: the noisy part
 // line. When it drops under the threshold, steering switches on and new allocations go high
 // from then on. Players who never reach the ceiling run exactly as before; a level or a mod
 // that would have hit the wall goes past it instead.
-static SIZE_T g_lowGuardMb = 512;      // -lowguard:MB, 0 with -nolowguard
-static bool   g_lowGuardOn = true;
+static SIZE_T g_lowGuardMb = 512;      // -lowguard:MB
+static bool   g_lowGuardOn = false;    // OFF by default - see below
 static bool   g_guardFired = false;
 
 // Free address space below 4 GB, in MB. A few hundred VirtualQuery calls; cheap enough for
@@ -5653,8 +5653,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	// The hooks themselves cost nothing while steering is off - one trampoline, one branch per
 	// allocation - and they have to be in before the engine starts asking for memory, because a
 	// hook installed halfway through cannot move what is already placed.
-	if (!lpCmdLine || !strstr(lpCmdLine, "-nolowguard"))
+	// lowguard is off until high memory is safe to switch on unattended.
+	//
+	// It was on by default, and that was wrong. High memory does not only risk a crash - it
+	// quietly breaks the game: a cutscene takes the player's body and never gives it back,
+	// leaving them able to look around and nothing else, on a level that cannot be finished.
+	// A guard that turns that on by itself, on someone else's machine, without being asked, is
+	// worse than the ceiling it was meant to avoid. It stays off until cutscenes survive.
+	if (lpCmdLine && strstr(lpCmdLine, "-lowguard"))
 	{
+		g_lowGuardOn = true;
 		const char* lg = strstr(lpCmdLine ? lpCmdLine : "", "-lowguard:");
 		if (lg)
 		{
