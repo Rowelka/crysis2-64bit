@@ -4053,9 +4053,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		StartRangeKeeper();   // it re-hooks modules as they map
 	}
 
-	// The same widening in the modules that carry their own copy of the allocator. Behind a flag
-	// until it has been run with: CrySystem's copy took a week to get right.
-	if (lpCmdLine && strstr(lpCmdLine, "-modfix"))
+	// The same widening in the modules that carry their own copy of the allocator. On by default:
+	// these are real bugs, not an experiment, and the correction costs nothing where memory is low
+	// anyway - the upper half it now writes is zero there. Measured over a full campaign run.
+	// -nomodfix turns it off.
+	if (!lpCmdLine || !strstr(lpCmdLine, "-nomodfix"))
 	{
 		DWORD tid = 0;
 		HANDLE th = CreateThread(NULL, 0, ModuleFixThread, NULL, 0, &tid);

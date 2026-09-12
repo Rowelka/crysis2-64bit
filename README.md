@@ -83,7 +83,7 @@ your machine and not on mine" into something answerable:
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
 | `-noaifix` | let the AI call into a destroyed target, as the game does |
 | `-nosndfix` | let the sound engine call into a destroyed object, as the game does |
-| `-modfix` | widen the same truncating stores in the other modules' copies of the allocator |
+| `-nomodfix` | leave the other modules' copies of the allocator truncating, as the game ships them |
 | `-topdown[:KB]` | serve large reservations from above the 4 GB line, so truncation faults on demand |
 | `-topdown:max` | put them at the very top of the address space instead (breaks dsound) |
 | `-arenahigh` | serve the allocator's arenas from above the 4 GB line, to exercise the corrections |
@@ -277,7 +277,7 @@ Command line flags:
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
 | `-noaifix` | let the AI call into a destroyed target |
 | `-nosndfix` | let the sound engine call into a destroyed object |
-| `-modfix` | widen the truncating stores in every module's copy of the allocator |
+| `-nomodfix` | leave the truncating stores in every module's copy of the allocator alone |
 | `-topdown[:KB]` | serve large reservations from above the 4 GB line |
 | `-arenahigh` | serve allocator arenas from above the 4 GB line |
 
