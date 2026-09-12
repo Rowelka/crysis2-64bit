@@ -1617,6 +1617,112 @@ static volatile LONG    g_topDownCalls = 0;
 static volatile LONG    g_topDownHigh  = 0;           // how many landed above 4 GB
 static unsigned long long g_topDownHighest = 0;
 static volatile LONGLONG  g_highBytes     = 0;   // how much actually went high
+
+// Why a request was left alone. The census says a quarter of memory went high and nothing about
+// what the other three quarters are. These four counters name them: a commit inside a region
+// that was reserved before the hook existed, a request for one particular address, something
+// below the threshold, or a file view, which is not this call at all.
+static volatile LONG     g_skipCommitOnly = 0;
+static volatile LONG     g_skipFixedAddr  = 0;
+static volatile LONG     g_skipTooSmall   = 0;
+static volatile LONGLONG g_skipCommitKb   = 0;
+static volatile LONGLONG g_skipFixedKb    = 0;
+static volatile LONGLONG g_skipSmallKb    = 0;
+
+// File views - the .pak archives among them - do not come through NtAllocateVirtualMemory at all.
+// They are mapped, and a hook that only watches allocation is blind to every byte of them.
+typedef LONG (__stdcall *PFN_NtMapView)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T,
+                                        PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+static PFN_NtMapView     g_origNtMapView = 0;
+static volatile LONG     g_mapCalls      = 0;
+static volatile LONG     g_mapHigh       = 0;
+static volatile LONGLONG g_mapKb         = 0;
+static volatile LONGLONG g_mapHighKb     = 0;
+static bool              g_topMap        = false;
+
+// Who is holding the memory down. Counting calls says how much was left alone and nothing about
+// who asked for it, and the answer decides where the next hook goes: a module with its own page
+// allocator is one problem, the process heap growing is another. Attribution is by the first
+// stack frame outside ntdll - RtlAllocateHeap and VirtualAlloc are pass-throughs, the module
+// above them is the caller that matters. A frame count that never leaves ntdll is the heap
+// itself, which has no caller worth naming.
+#define CALLER_SLOTS 20
+typedef struct { volatile LONGLONG site; volatile LONGLONG kb; volatile LONGLONG kbLow;
+                 volatile LONG calls; volatile LONG low; } CallerSite;
+static CallerSite g_callers[CALLER_SLOTS];
+
+// ntdll, kernelbase, kernel32 and this launcher itself are all pass-throughs on the way down:
+// stopping at any of them names the plumbing instead of the caller. The first frame outside all
+// four is the module that actually wanted the memory.
+#define PASS_SLOTS 5
+static unsigned long long g_passLo[PASS_SLOTS], g_passHi[PASS_SLOTS];
+static int g_passCount = 0;
+typedef USHORT (WINAPI *PFN_CapStack)(ULONG, ULONG, PVOID*, PULONG);
+static PFN_CapStack g_capStack = 0;
+
+static void AttributeCall(SIZE_T bytes, bool high)
+{
+	if (!g_capStack || bytes < 256 * 1024) return;
+
+	void* frames[12];
+	const USHORT n = g_capStack(1, 12, frames, NULL);
+	LONGLONG site = 1;                      // 1 = never left ntdll: the process heap growing
+	for (USHORT i = 0; i < n; i++)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)frames[i];
+		bool through = false;
+		for (int k = 0; k < g_passCount; k++)
+			if (a >= g_passLo[k] && a < g_passHi[k]) { through = true; break; }
+		if (!through) { site = (LONGLONG)a; break; }
+	}
+
+	for (int i = 0; i < CALLER_SLOTS; i++)
+	{
+		if (g_callers[i].site != site)
+		{
+			if (g_callers[i].site != 0) continue;
+			if (InterlockedCompareExchange64((volatile LONGLONG*)&g_callers[i].site,
+			                                 site, 0) != 0)
+			{
+				if (g_callers[i].site != site) continue;
+			}
+		}
+		InterlockedExchangeAdd64((volatile LONGLONG*)&g_callers[i].kb,
+		                         (LONGLONG)(bytes / 1024));
+		InterlockedIncrement(&g_callers[i].calls);
+		if (!high)
+		{
+			InterlockedExchangeAdd64((volatile LONGLONG*)&g_callers[i].kbLow,
+			                         (LONGLONG)(bytes / 1024));
+			InterlockedIncrement(&g_callers[i].low);
+		}
+		return;
+	}
+}
+
+static void AddPassThrough(HMODULE m)
+{
+	if (!m || g_passCount >= PASS_SLOTS) return;
+	const unsigned long long lo = (unsigned long long)(ULONG_PTR)m;
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)m;
+	const IMAGE_NT_HEADERS64* pe =
+		(const IMAGE_NT_HEADERS64*)((const unsigned char*)m + dos->e_lfanew);
+	g_passLo[g_passCount] = lo;
+	g_passHi[g_passCount] = lo + pe->OptionalHeader.SizeOfImage;
+	g_passCount++;
+}
+
+static void PrepareAttribution(void)
+{
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	if (!nt) return;
+	g_capStack = (PFN_CapStack)GetProcAddress(nt, "RtlCaptureStackBackTrace");
+
+	AddPassThrough(nt);
+	AddPassThrough(GetModuleHandleA("kernelbase.dll"));
+	AddPassThrough(GetModuleHandleA("kernel32.dll"));
+	AddPassThrough(GetModuleHandleA(NULL));      // the launcher's own hook is a pass-through too
+}
 static unsigned long long g_topDownLowest  = ~0ull;
 
 static LPVOID WINAPI TopDownVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
@@ -1828,6 +1934,27 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 	const bool steer = base && (*base == NULL) && size && (*size >= g_topDownMin) &&
 	                   ((type & MEM_RESERVE) != 0) && (proc == (HANDLE)(LONG_PTR)-1);
 
+	if (!steer && g_topDown && base && size && proc == (HANDLE)(LONG_PTR)-1)
+	{
+		const LONGLONG kb = (LONGLONG)(*size / 1024);
+		AttributeCall(*size, (unsigned long long)(ULONG_PTR)*base > 0xFFFFFFFFull);
+		if (*base != NULL)
+		{
+			InterlockedIncrement(&g_skipFixedAddr);
+			InterlockedExchangeAdd64(&g_skipFixedKb, kb);
+		}
+		else if ((type & MEM_RESERVE) == 0)
+		{
+			InterlockedIncrement(&g_skipCommitOnly);
+			InterlockedExchangeAdd64(&g_skipCommitKb, kb);
+		}
+		else
+		{
+			InterlockedIncrement(&g_skipTooSmall);
+			InterlockedExchangeAdd64(&g_skipSmallKb, kb);
+		}
+	}
+
 	if (steer && CalledByUnreadyModule())
 	{
 		InterlockedIncrement(&g_highSkipped);
@@ -1869,6 +1996,72 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 		if (a < g_topDownLowest)  g_topDownLowest  = a;
 	}
 	return st;
+}
+
+// Counts every file view, and with -topmap steers them high as well. Counting is the point:
+// if the .pak archives are a gigabyte of the address space, no amount of work on the allocator
+// moves the number, and the next thing to hook is this call, not that one.
+static LONG __stdcall CountedNtMapView(HANDLE section, HANDLE proc, PVOID* base,
+                                       ULONG_PTR zeroBits, SIZE_T commit,
+                                       PLARGE_INTEGER offset, PSIZE_T viewSize,
+                                       DWORD inherit, ULONG type, ULONG protect)
+{
+	const bool ours = (proc == (HANDLE)(LONG_PTR)-1) && base && viewSize;
+
+	if (ours && g_topMap && *base == NULL && *viewSize >= g_topDownMin)
+		type |= MEM_TOP_DOWN;
+
+	LONG st = g_origNtMapView(section, proc, base, zeroBits, commit, offset,
+	                          viewSize, inherit, type, protect);
+
+	if (ours && st >= 0 && *base && *viewSize)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+		const LONGLONG kb = (LONGLONG)(*viewSize / 1024);
+		InterlockedIncrement(&g_mapCalls);
+		InterlockedExchangeAdd64(&g_mapKb, kb);
+		if (a > 0xFFFFFFFFull)
+		{
+			InterlockedIncrement(&g_mapHigh);
+			InterlockedExchangeAdd64(&g_mapHighKb, kb);
+		}
+	}
+	return st;
+}
+
+static const char* HookNtMapView(void)
+{
+	if (g_origNtMapView) return "already";
+
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	if (!nt) return "no ntdll";
+
+	unsigned char* at = (unsigned char*)GetProcAddress(nt, "NtMapViewOfSection");
+	if (!at) return "no NtMapViewOfSection";
+
+	if (!(at[0] == 0x4C && at[1] == 0x8B && at[2] == 0xD1 && at[3] == 0xB8))
+		return "unfamiliar stub";
+
+	unsigned char* cave = AllocCaveNear(at);
+	if (!cave) return "no cave";
+
+	memcpy(cave, at, 8);
+	cave[8] = 0xE9;
+	{
+		const long rel = (long)((at + 8) - (cave + 13));
+		memcpy(cave + 9, &rel, 4);
+	}
+	g_origNtMapView = (PFN_NtMapView)cave;
+
+	unsigned char* pad = cave + 32;
+	pad[0] = 0xFF; pad[1] = 0x25; pad[2] = 0x00; pad[3] = 0x00; pad[4] = 0x00; pad[5] = 0x00;
+	{
+		void* target = (void*)CountedNtMapView;
+		memcpy(pad + 6, &target, 8);
+	}
+
+	if (!WriteJump(at, pad, 8)) { g_origNtMapView = 0; return "jump failed"; }
+	return "applied";
 }
 
 static const char* HookNtAlloc(void)
@@ -2003,6 +2196,52 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 
 		if (g_topDown)
 		{
+			int s = sprintf(line, "  left low: %ld commit-only (%lld MB), %ld fixed address "
+			                "(%lld MB), %ld under threshold (%lld MB)%s",
+			                g_skipCommitOnly, g_skipCommitKb / 1024,
+			                g_skipFixedAddr,  g_skipFixedKb / 1024,
+			                g_skipTooSmall,   g_skipSmallKb / 1024, "\n");
+			AppendFaultLog(line, (unsigned long)s);
+
+			s = sprintf(line, "  file views: %ld mapped (%lld MB), %ld above 4 GB (%lld MB)%s",
+			            g_mapCalls, g_mapKb / 1024, g_mapHigh, g_mapHighKb / 1024, "\n");
+			AppendFaultLog(line, (unsigned long)s);
+
+			// Who asked, biggest first. Anything under 16 MB is noise next to the gigabyte
+			// this is meant to explain.
+			for (int q = 0; q < CALLER_SLOTS; q++)
+			{
+				const LONGLONG site = g_callers[q].site;
+				if (!site || g_callers[q].kb < 16 * 1024) continue;
+
+				char who[96];
+				if (site == 1)
+					strcpy(who, "(process heap, never left ntdll)");
+				else
+				{
+					HMODULE mod = 0;
+					if (GetModuleHandleExA(0x00000004 | 0x00000002,
+					                       (LPCSTR)(ULONG_PTR)site, &mod) && mod)
+					{
+						char full[MAX_PATH];
+						if (GetModuleFileNameA(mod, full, MAX_PATH))
+						{
+							const char* b = strrchr(full, '\\');
+							sprintf(who, "%s+0x%llX", b ? b + 1 : full,
+							        (unsigned long long)site -
+							        (unsigned long long)(ULONG_PTR)mod);
+						}
+						else sprintf(who, "0x%llX", (unsigned long long)site);
+					}
+					else sprintf(who, "0x%llX (no module)", (unsigned long long)site);
+				}
+
+				s = sprintf(line, "  holding: %s  %lld MB (%lld MB low) in %ld call(s)%s",
+				            who, g_callers[q].kb / 1024, g_callers[q].kbLow / 1024,
+				            g_callers[q].calls, "\n");
+				AppendFaultLog(line, (unsigned long)s);
+			}
+
 			int m = sprintf(line, "  topdown: %ld steered, %ld above 4 GB (%lld MB), "
 			                "0x%llX..0x%llX%s",
 			                g_topDownCalls, g_topDownHigh, g_highBytes / (1024 * 1024),
@@ -4044,11 +4283,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		g_topDown = true;
 		if (strstr(lpCmdLine, "-topdown:max")) g_topDownMax = true;
 
+		if (strstr(lpCmdLine, "-topmap")) g_topMap = true;
+		PrepareAttribution();
+
 		const int hooked = HookTopDownEverywhere();
 		const char* deep = HookNtAlloc();
-		char line[160];
-		int n = sprintf(line, "  topdown: on, %d import(s) redirected, ntdll %s, threshold %u KB%s",
-		                hooked, deep, (unsigned)(g_topDownMin / 1024), "\n");
+		const char* maps = HookNtMapView();
+		char line[224];
+		int n = sprintf(line, "  topdown: on, %d import(s) redirected, ntdll %s, views %s%s, "
+		                "threshold %u KB%s",
+		                hooked, deep, maps, g_topMap ? " (steered)" : " (counted)",
+		                (unsigned)(g_topDownMin / 1024), "\n");
 		AppendFaultLog(line, (unsigned long)n);
 		StartRangeKeeper();   // it re-hooks modules as they map
 	}
