@@ -393,6 +393,30 @@ files). Comparing pak sizes settles that in seconds instead of a debugging sessi
 Nothing user-identifying is collected: no user name, no profile paths, no serials, no network
 information.
 
+## Running out of room below 4 GB
+
+The crash testers hit on the heavy levels is not a bug in any one place. It is the 32-bit
+ceiling arriving: this engine keeps its memory below the 4 GB line, and when the free address
+space down there runs out, the next allocation fails and the game dies. Nothing in the log points
+at a cause, because there isn't one - the game simply ran out of room in a place a 64-bit process
+should not have a limit at all.
+
+The launcher now watches for it. The hooks are installed at startup and do nothing; a check every
+couple of seconds measures the free address space below 4 GB, and if it drops under 512 MB,
+allocations from that point on are placed above the line instead:
+
+```
+lowguard: 412 MB free below 4 GB, under the 512 MB mark - new allocations go high from here
+```
+
+Players who never approach the ceiling run exactly as they did before - same addresses, same
+layout, nothing steered. A level or a mod that would have hit the wall goes past it.
+
+This only works because of the pointer-truncation corrections: the allocator writes 32 bits of a
+64-bit pointer in eight places per module, and memory above 4 GB is fatal without them. They are
+on by default. `-lowguard:MB` changes the threshold, `-nolowguard` turns the watch off, and
+`-topdown` is still there for placing everything high from the start.
+
 ## Is it really a 64-bit build
 
 A 64-bit executable that never puts a byte above the 4 GB line is 64-bit in file format only.

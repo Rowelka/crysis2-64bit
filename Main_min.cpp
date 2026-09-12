@@ -1641,6 +1641,44 @@ static volatile LONGLONG g_mapHighKb     = 0;
 static bool              g_topMap        = false;
 static bool              g_memDebug      = false;   // -memdebug: the noisy part of the above
 
+// lowguard - the reason all of the above exists.
+//
+// This engine crashes when it runs out of address space below 4 GB, and that is the crash
+// testers see on the heavy levels: not a bug in any one place, just the 32-bit ceiling arriving.
+// Steering everything high all the time would be the blunt answer, and it changes the memory
+// layout for every player including the ones who never come near the ceiling.
+//
+// So the hooks go in always and do nothing, and a watcher measures the free space below the
+// line. When it drops under the threshold, steering switches on and new allocations go high
+// from then on. Players who never reach the ceiling run exactly as before; a level or a mod
+// that would have hit the wall goes past it instead.
+static SIZE_T g_lowGuardMb = 512;      // -lowguard:MB, 0 with -nolowguard
+static bool   g_lowGuardOn = true;
+static bool   g_guardFired = false;
+
+// Free address space below 4 GB, in MB. A few hundred VirtualQuery calls; cheap enough for
+// every couple of seconds.
+static unsigned long long FreeBelow4GB(void)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	unsigned long long at = 0x10000, free = 0;
+
+	for (int guard = 0; guard < 200000; guard++)
+	{
+		if (at >= 0x100000000ull) break;
+		if (!VirtualQuery((LPCVOID)(ULONG_PTR)at, &mbi, sizeof(mbi))) break;
+
+		unsigned long long size = (unsigned long long)mbi.RegionSize;
+		if (at + size > 0x100000000ull) size = 0x100000000ull - at;
+		if (mbi.State == MEM_FREE) free += size;
+
+		const unsigned long long next = at + (unsigned long long)mbi.RegionSize;
+		if (next <= at) break;
+		at = next;
+	}
+	return free / (1024 * 1024);
+}
+
 // Who is holding the memory down. Counting calls says how much was left alone and nothing about
 // who asked for it, and the answer decides where the next hook goes: a module with its own page
 // allocator is one problem, the process heap growing is another. Attribution is by the first
@@ -1777,12 +1815,19 @@ static void AddPassThrough(HMODULE m)
 {
 	if (!m || g_passCount >= PASS_SLOTS) return;
 	const unsigned long long lo = (unsigned long long)(ULONG_PTR)m;
-	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)m;
-	const IMAGE_NT_HEADERS64* pe =
-		(const IMAGE_NT_HEADERS64*)((const unsigned char*)m + dos->e_lfanew);
-	g_passLo[g_passCount] = lo;
-	g_passHi[g_passCount] = lo + pe->OptionalHeader.SizeOfImage;
-	g_passCount++;
+
+	__try
+	{
+		const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)m;
+		const IMAGE_NT_HEADERS64* pe =
+			(const IMAGE_NT_HEADERS64*)((const unsigned char*)m + dos->e_lfanew);
+		g_passLo[g_passCount] = lo;
+		g_passHi[g_passCount] = lo + pe->OptionalHeader.SizeOfImage;
+		g_passCount++;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
 }
 
 static void PrepareAttribution(void)
@@ -1951,7 +1996,7 @@ static LPVOID WINAPI HighHeapReAlloc(HANDLE heap, DWORD flags, LPVOID p, SIZE_T 
 
 // Replaces every import that currently points at 'from'. Matching by address rather than by name
 // catches the api-ms-win-core-memory forwarders as well, which is what most of these DLLs import.
-static int RedirectImportsByAddress(HMODULE mod, void* from, void* to)
+static int RedirectImportsByAddressUnsafe(HMODULE mod, void* from, void* to)
 {
 	unsigned char* base = (unsigned char*)mod;
 	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
@@ -1981,6 +2026,23 @@ static int RedirectImportsByAddress(HMODULE mod, void* from, void* to)
 		}
 	}
 	return done;
+}
+
+// A module can be unloaded between being listed and having its header read, and then reading it
+// faults on a page that was mapped a moment ago. Downtown died exactly there: the shader warm-up
+// loads D3DCompiler_42.dll and drops it again, and the crash landed in this function with the
+// module's base address in both registers. Nothing here is worth a crash - a module that went
+// away has no imports left to redirect.
+static int RedirectImportsByAddress(HMODULE mod, void* from, void* to)
+{
+	__try
+	{
+		return RedirectImportsByAddressUnsafe(mod, from, to);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return 0;
+	}
 }
 
 // Every module mapped right now. Called again as modules appear, since the engine loads most of
@@ -2280,7 +2342,11 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 	const bool bigOne = g_memDebug && size && *size >= 8 * 1024 * 1024 &&
 	                    InterlockedIncrement(&g_bigSeen) <= 60;
 
-	const bool steer = base && (*base == NULL) && size && (*size >= g_topDownMin) &&
+	// g_topDown is the switch: off until -topdown says so, or until lowguard sees the low
+	// address space running out. The hook itself is always installed, because it cannot move
+	// what was placed before it existed - but with the switch off it only counts.
+	const bool steer = g_topDown && base && (*base == NULL) && size &&
+	                   (*size >= g_topDownMin) &&
 	                   ((type & (MEM_RESERVE | MEM_COMMIT)) != 0) &&
 	                   (proc == (HANDLE)(LONG_PTR)-1);
 
@@ -2805,6 +2871,29 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		// Watched whatever the flags say: the question is whether these regions are something
 		// this launcher causes or something the game does anyway.
 		WatchNewSlabs(elapsed);
+
+		// The ceiling, watched for rather than waited for.
+		if (g_lowGuardOn && !g_topDown && (i % 2) == 0)
+		{
+			const unsigned long long freeMb = FreeBelow4GB();
+			if (freeMb < (unsigned long long)g_lowGuardMb)
+			{
+				g_topDown = true;
+				g_guardFired = true;
+				HookTopDownEverywhere();
+
+				int m = sprintf(line, "  lowguard: %llu MB free below 4 GB, under the %u MB "
+				                "mark - new allocations go high from here%s",
+				                freeMb, (unsigned)g_lowGuardMb, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+			}
+			else if (elapsed % 300 == 0)
+			{
+				int m = sprintf(line, "  lowguard: %llu MB still free below 4 GB%s",
+				                freeMb, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+			}
+		}
 
 		// Late enough that a level is loaded and the engine is doing its normal work.
 		if (g_stressGb && elapsed >= 40)
@@ -5046,6 +5135,31 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		if (th) CloseHandle(th);
 	}
 
+	// The hooks themselves cost nothing while steering is off - one trampoline, one branch per
+	// allocation - and they have to be in before the engine starts asking for memory, because a
+	// hook installed halfway through cannot move what is already placed.
+	if (!lpCmdLine || !strstr(lpCmdLine, "-nolowguard"))
+	{
+		const char* lg = strstr(lpCmdLine ? lpCmdLine : "", "-lowguard:");
+		if (lg)
+		{
+			const unsigned mb = (unsigned)atoi(lg + 10);
+			if (mb) g_lowGuardMb = (SIZE_T)mb;
+		}
+
+		const char* deep = HookNtAlloc();
+		const char* deepEx = HookNtAllocEx();
+		PrepareAttribution();
+		StartRangeKeeper();
+
+		char line[200];
+		int n = sprintf(line, "  lowguard: watching, ntdll %s, ex %s, threshold %u MB%s",
+		                deep, deepEx, (unsigned)g_lowGuardMb, "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+	else
+		g_lowGuardOn = false;
+
 	// -memstress:GB asks the engine's own allocator for that many gigabytes once a level is up,
 	// writes every page and reads it back. The exam the rest of this was built for.
 	if (lpCmdLine && strstr(lpCmdLine, "-memstress"))
@@ -5101,6 +5215,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 			                 (unsigned)(g_heapHighMin / 1024), "\n");
 			AppendFaultLog(hl, (unsigned long)hn);
 		}
+
+		g_lowGuardOn = false;                 // asked for explicitly, no need to wait for a wall
 
 		const int hooked = HookTopDownEverywhere();
 		const char* deep = HookNtAlloc();
