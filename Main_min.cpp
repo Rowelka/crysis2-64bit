@@ -1927,6 +1927,18 @@ static char g_keepLowNames[KEEPLOW_SLOTS][40];
 static int  g_keepLowCount = 0;
 static bool g_highAction = false;   // -highaction: steer CryAction's memory too
 static bool g_gameLow    = false;   // -gamelow: leave the entire game layer low
+// The arena band stays low by default.
+//
+// Bisected on two levels through the menu: high memory breaks cutscenes and NPC spawns, a 16 MB
+// threshold does not, and every allocation in the band between is exactly 15 MB - asked for by
+// the renderer, physics, animation, 3DEngine and CrySystem alike. That is the allocator's arena.
+// Pinning just that band costs little and keeps the game correct: 1179 MB a level still goes
+// high, against 151 MB when the whole threshold is raised instead.
+//
+// Moving the arenas above a terabyte was tried, in case the allocator's address-indexed table
+// was the problem. It was not: the game broke the same way.
+static unsigned g_bandLoKb = 14 * 1024, g_bandHiKb = 16 * 1024;   // -keepband:LO-HI, in MB
+static volatile LONG g_bandKept = 0;
 
 static void ParseKeepLow(const char* cmd)
 {
@@ -2455,7 +2467,17 @@ typedef LONG (__stdcall *PFN_NtAllocVM)(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULON
 
 static PFN_NtAllocVM      g_origNtAlloc = 0;
 static bool               g_topDownMax  = false;              // the very edge of the space
+// Where high memory starts. 8 GB by default.
+//
+// -highbase:GB moves it, and the reason is in Crytek's own allocator: it indexes its arenas by
+// address, shifting the pointer right by 40 bits and using the result as a slot in a fixed-size
+// table sized for 2 GB. Below a terabyte that shift yields the same slot for every address, so
+// arenas placed high land in the same bucket as the ones down low, and the lookup that asks
+// "which arena owns this pointer" starts answering with the wrong one. Placing them past a
+// terabyte gives them a slot of their own.
 static volatile LONGLONG  g_highCursor  = 0x200000000LL;      // 8 GB, and climbing
+static LONGLONG           g_highBase    = 0x200000000LL;
+static LONGLONG           g_highCeiling = 0x4000000000LL;     // 256 GB
 
 // Memory high enough to expose a lost upper half, low enough that the rest of Windows still
 // works. MEM_TOP_DOWN hands out 0x00007FF4........, and at that height dsound.dll dies on its
@@ -2526,13 +2548,13 @@ static LONG TryHighAt(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size
 	for (int attempt = 0; attempt < 24; attempt++)
 	{
 		LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, step);
-		if (at > 0x4000000000LL)                                       // past 256 GB
+		if (at > g_highCeiling)
 		{
 			// Wrap rather than give up: what was freed along the way has left gaps, and the
 			// next pass over the range finds them.
-			InterlockedExchange64(&g_highCursor, 0x200000000LL);
+			InterlockedExchange64(&g_highCursor, g_highBase);
 			at = InterlockedExchangeAdd64(&g_highCursor, step);
-			if (at > 0x4000000000LL) return -1;
+			if (at > g_highCeiling) return -1;
 		}
 
 		PVOID p = (PVOID)(ULONG_PTR)at;
@@ -2596,8 +2618,8 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 		}
 
 		char al[220];
-		int an = sprintf(al, "  asks: %llu MB wanted by %s%s",
-		                 (unsigned long long)(*size / (1024 * 1024)), who, "\n");
+		int an = sprintf(al, "  asks: %llu bytes (0x%llX) wanted by %s%s",
+		                 (unsigned long long)*size, (unsigned long long)*size, who, "\n");
 		AppendFaultLog(al, (unsigned long)an);
 	}
 
@@ -2629,6 +2651,20 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 			InterlockedIncrement(&g_skipTooSmall);
 			InterlockedExchangeAdd64(&g_skipSmallKb, kb);
 		}
+	}
+
+	// -keepband:LO-HI (in MB): allocations in this size band stay low, whoever asked.
+	//
+	// Bisection landed here: high memory at a 12 MB threshold breaks the game, at 16 MB it is
+	// fine, and every allocation in between is exactly 15 MB - asked for by the renderer, the
+	// physics, the animation system, 3DEngine and CrySystem alike. One size from every
+	// subsystem is not a coincidence; that is the allocator's arena, the slab it carves small
+	// blocks out of. So the band can be pinned and everything else can still go high.
+	if (steer && g_bandLoKb && *size >= (SIZE_T)g_bandLoKb * 1024 &&
+	    *size <= (SIZE_T)g_bandHiKb * 1024)
+	{
+		InterlockedIncrement(&g_bandKept);
+		return g_origNtAlloc(proc, base, zeroBits, size, type, protect);
 	}
 
 	// Anything sizeable that the driver asked for stays where it would have been.
@@ -2813,11 +2849,11 @@ static LONG TryHighAtEx(HANDLE proc, PVOID* base, SIZE_T* size, ULONG type, ULON
 	for (int attempt = 0; attempt < 24; attempt++)
 	{
 		LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, step);
-		if (at > 0x4000000000LL)
+		if (at > g_highCeiling)
 		{
-			InterlockedExchange64(&g_highCursor, 0x200000000LL);
+			InterlockedExchange64(&g_highCursor, g_highBase);
 			at = InterlockedExchangeAdd64(&g_highCursor, step);
-			if (at > 0x4000000000LL) return -1;
+			if (at > g_highCeiling) return -1;
 		}
 
 		PVOID p = (PVOID)(ULONG_PTR)at;
@@ -5728,6 +5764,35 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		ParseKeepLow(lpCmdLine);
 		if (strstr(lpCmdLine, "-highaction")) g_highAction = true;
 		if (strstr(lpCmdLine, "-gamelow"))    g_gameLow    = true;
+		{
+			const char* hb = strstr(lpCmdLine, "-highbase:");
+			if (hb)
+			{
+				const unsigned gb = (unsigned)atoi(hb + 10);
+				if (gb)
+				{
+					g_highBase    = (LONGLONG)gb * 1024 * 1024 * 1024;
+					g_highCursor  = g_highBase;
+					g_highCeiling = g_highBase + 0x4000000000LL;
+				}
+			}
+		}
+		{
+			const char* kb = strstr(lpCmdLine, "-keepband:");
+			if (kb)
+			{
+				unsigned lo = 0, hi = 0;
+				if (sscanf(kb + 10, "%u-%u", &lo, &hi) == 2 && hi >= lo)
+				{
+					g_bandLoKb = lo * 1024;
+					g_bandHiKb = hi * 1024;
+				}
+				else if (strncmp(kb + 10, "off", 3) == 0)
+				{
+					g_bandLoKb = g_bandHiKb = 0;   // steer the arenas too, for investigating
+				}
+			}
+		}
 		PrepareAttribution();
 
 		// -heaphigh[:KB]: large heap blocks out of the process heap entirely. Where the memory
