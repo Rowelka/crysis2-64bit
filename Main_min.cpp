@@ -1894,7 +1894,7 @@ static void AttributeCall(SIZE_T bytes, bool high)
 // is free to pack pointers however it likes. Steering its allocations high is a bet with no
 // evidence behind it - and the cutscene failure is what losing that bet looks like, since a
 // video sequence is exactly the path that runs through the driver.
-#define DRIVER_SLOTS 14   // the driver halves, plus whatever -keeplow adds
+#define DRIVER_SLOTS 24   // the driver halves, plus whatever -keeplow adds
 static unsigned long long g_drvLo[DRIVER_SLOTS], g_drvHi[DRIVER_SLOTS];
 static int  g_drvCount = 0;
 static volatile LONG g_drvLeftAlone = 0;
@@ -1926,6 +1926,7 @@ static void NoteDriverModule(HMODULE m)
 static char g_keepLowNames[KEEPLOW_SLOTS][40];
 static int  g_keepLowCount = 0;
 static bool g_highAction = false;   // -highaction: steer CryAction's memory too
+static bool g_gameLow    = false;   // -gamelow: leave the entire game layer low
 
 static void ParseKeepLow(const char* cmd)
 {
@@ -1951,6 +1952,22 @@ static void FindDriverModules(void)
 	};
 	for (int i = 0; i < (int)(sizeof(kDriverNames) / sizeof(kDriverNames[0])); i++)
 		NoteDriverModule(GetModuleHandleA(kDriverNames[i]));
+
+	// -gamelow: the whole game layer stays where it is.
+	//
+	// The corrections cover the allocator, the sound system, the renderer and the Lua pool -
+	// those were found, patched and verified byte for byte. The game layer was never checked
+	// against high memory at all, and it is where the cutscene damage shows. Until the exact
+	// site is known, the honest split is "steer what was verified, leave the rest".
+	if (g_gameLow)
+	{
+		static const char* const kGameLayer[] = {
+			"CryAction.dll", "CryGameReal.dll", "CryGameCrysis2.dll", "CryMovie.dll",
+			"CryEntitySystem.dll", "CryAnimation.dll", "CryAISystem.dll", "CryNetwork.dll",
+		};
+		for (int i = 0; i < (int)(sizeof(kGameLayer) / sizeof(kGameLayer[0])); i++)
+			NoteDriverModule(GetModuleHandleA(kGameLayer[i]));
+	}
 
 	// CryAction, unless the command line insists otherwise.
 	//
@@ -5710,6 +5727,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		if (strstr(lpCmdLine, "-memdebug")) g_memDebug = true;
 		ParseKeepLow(lpCmdLine);
 		if (strstr(lpCmdLine, "-highaction")) g_highAction = true;
+		if (strstr(lpCmdLine, "-gamelow"))    g_gameLow    = true;
 		PrepareAttribution();
 
 		// -heaphigh[:KB]: large heap blocks out of the process heap entirely. Where the memory
