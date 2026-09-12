@@ -1925,6 +1925,7 @@ static void NoteDriverModule(HMODULE m)
 #define KEEPLOW_SLOTS 8
 static char g_keepLowNames[KEEPLOW_SLOTS][40];
 static int  g_keepLowCount = 0;
+static bool g_highAction = false;   // -highaction: steer CryAction's memory too
 
 static void ParseKeepLow(const char* cmd)
 {
@@ -1950,6 +1951,20 @@ static void FindDriverModules(void)
 	};
 	for (int i = 0; i < (int)(sizeof(kDriverNames) / sizeof(kDriverNames[0])); i++)
 		NoteDriverModule(GetModuleHandleA(kDriverNames[i]));
+
+	// CryAction, unless the command line insists otherwise.
+	//
+	// Steering its memory high stops cutscenes from taking over the view: the sequence does
+	// start - the player loses control and their model is hidden - but the camera never
+	// switches to the one the sequence drives, so the player stands in their own eyes able
+	// only to look around. Bisection put it in this module; what exactly breaks inside is not
+	// found yet, and until it is, the honest thing is to leave the module alone rather than
+	// bet that it is fine. -highaction opts back in, for looking into it.
+	if (!g_highAction)
+	{
+		HMODULE ca = GetModuleHandleA("CryAction.dll");
+		if (ca) NoteDriverModule(ca);
+	}
 
 	// Whatever the command line asked to leave alone, treated the same way.
 	for (int i = 0; i < g_keepLowCount; i++)
@@ -5686,6 +5701,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		if (strstr(lpCmdLine, "-topmap")) g_topMap = true;
 		if (strstr(lpCmdLine, "-memdebug")) g_memDebug = true;
 		ParseKeepLow(lpCmdLine);
+		if (strstr(lpCmdLine, "-highaction")) g_highAction = true;
 		PrepareAttribution();
 
 		// -heaphigh[:KB]: large heap blocks out of the process heap entirely. Where the memory
