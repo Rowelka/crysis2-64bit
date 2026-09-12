@@ -2913,6 +2913,91 @@ static const char* HookNtAlloc(void)
 	return "applied";
 }
 
+// -trace: where the engine's camera is, four times a second, written to a file.
+//
+// The cutscene failure was invisible to everything we had: no exception, no log line, nothing
+// in Game.log. The only thing that differs between a cutscene that plays and one that does not
+// is that the camera moves on its own while the player stands still. So that is what gets
+// recorded, and a run can be judged afterwards without anyone watching the screen.
+//
+// The path to it is the one the mechanics work already uses: gEnv is a global in CryGameReal,
+// pSystem sits at +0xB0, and the view matrix at +0x4B0 - a Matrix34, so the position is the
+// last column: elements 3, 7 and 11.
+#define GENV_RVA_IN_GAMEREAL 0xA0E8C0
+#define PSYSTEM_OFF          0xB0
+#define VIEWMATRIX_OFF       0x4B0
+
+static bool g_trace = false;
+
+static bool ReadCameraPos(float* out3)
+{
+	HMODULE gr = GetModuleHandleA("CryGameReal.dll");
+	if (!gr) return false;
+
+	ULONG_PTR env = 0;
+	if (!SafePeek((unsigned char*)gr + GENV_RVA_IN_GAMEREAL, &env) || env < 0x10000)
+		return false;
+
+	ULONG_PTR sys = 0;
+	if (!SafePeek((unsigned char*)env + PSYSTEM_OFF, &sys) || sys < 0x10000)
+		return false;
+
+	const float* m = (const float*)((unsigned char*)sys + VIEWMATRIX_OFF);
+	ULONG_PTR probe = 0;
+	if (!SafePeek(m, &probe)) return false;
+
+	__try
+	{
+		out3[0] = m[3];
+		out3[1] = m[7];
+		out3[2] = m[11];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+
+	// A camera at the origin means the engine has not placed it yet.
+	return (out3[0] != 0.0f) || (out3[1] != 0.0f) || (out3[2] != 0.0f);
+}
+
+static DWORD WINAPI CameraTraceThread(LPVOID)
+{
+	const DWORD started = GetTickCount();
+	char line[160];
+
+	int n = sprintf(line, "=== camera trace, one sample every 250 ms%s", "\n");
+	AppendTextFile("camera_trace.txt", line, (unsigned long)n);
+
+	float last[3] = { 0, 0, 0 };
+	bool  haveLast = false;
+
+	for (;;)
+	{
+		Sleep(250);
+
+		float pos[3];
+		if (!ReadCameraPos(pos)) continue;
+
+		// Distance since the previous sample, so a reader can tell movement from stillness
+		// without doing the arithmetic itself.
+		float moved = 0.0f;
+		if (haveLast)
+		{
+			const float dx = pos[0] - last[0], dy = pos[1] - last[1], dz = pos[2] - last[2];
+			// Squared distance: no math header needed, and a reader comparing runs cares
+			// about "moved or not", not about metres.
+			moved = dx * dx + dy * dy + dz * dz;
+		}
+		last[0] = pos[0]; last[1] = pos[1]; last[2] = pos[2];
+		haveLast = true;
+
+		n = sprintf(line, "%u %.2f %.2f %.2f %.3f%s", (unsigned)(GetTickCount() - started),
+		            pos[0], pos[1], pos[2], moved, "\n");
+		AppendTextFile("camera_trace.txt", line, (unsigned long)n);
+	}
+}
+
 // -memstress:GB - the examination this whole effort is for.
 //
 // Everything until now measured where memory landed. This asks the question the mod work
@@ -5541,6 +5626,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 	}
 
 	CheckGameBuild();
+
+	if (lpCmdLine && strstr(lpCmdLine, "-trace"))
+	{
+		g_trace = true;
+		DWORD tid = 0;
+		HANDLE th = CreateThread(NULL, 0, CameraTraceThread, NULL, 0, &tid);
+		if (th) CloseHandle(th);
+	}
 
 	// The hooks themselves cost nothing while steering is off - one trampoline, one branch per
 	// allocation - and they have to be in before the engine starts asking for memory, because a
