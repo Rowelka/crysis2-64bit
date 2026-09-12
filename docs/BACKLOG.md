@@ -135,16 +135,40 @@ Measured, playing:
 | | below 4 GB | above 4 GB |
 |---|---|---|
 | without `-topdown` | 1831 MB | **0 MB** |
-| with `-topdown -modfix` | 1645 MB | **622 MB (27%)** |
+| with `-topdown -modfix`, first version | 1645 MB | 622 MB |
+| after the filter fix | 1699 MB | **1799 MB placed high a level** |
 
 Before this, the 64-bit build never put a single byte above the 4 GB line - it was 64-bit in
 file format only. With the corrections in, TimesSquare, Downtown and CentralStation each load in
 their usual time and play with no exceptions at all.
 
-**Still open:** the other 73 percent. Most of the game's memory comes from the process heap,
-which reserved its first regions before the launcher could hook anything, and from file mappings
-for the .pak archives. Raising that share is what remains, along with running the whole campaign
-this way rather than three levels.
+**Answered since.** The 73 percent was two separate things, and neither is what it looked like.
+
+Most of it was a bug in the hook, not in the engine. A request with `MEM_COMMIT` and no
+`MEM_RESERVE` reserves as well, as long as the address is left to the system, and that is how
+the CRT heap asks for every large block. The filter insisted on `MEM_RESERVE` and walked past
+1148 MB a level. With that fixed, `commit-only` went from 1149 MB to zero and MSVCR90 holds
+nothing below the line.
+
+What is left - about 1.6 GB - is not the engine's memory at all. Every large block the hook sees
+now goes high (56 of 56 on a level, 5 MB of rounding low), while the low regions are 59 slabs of
+8 to 32 MB with addresses the hook never handed out: fully committed, never written (0 of 256
+probes), one of them `PAGE_WRITECOMBINE`, which is the protection for memory a GPU writes
+through. No module of the game contains a direct syscall stub and `NtAllocateVirtualMemoryEx` is
+hooked and never called, so nothing is going around the hook in user mode. The kernel maps these
+for the display driver and their address is not ours to choose.
+
+So the figure to quote is not a percentage of all memory. It is: of what the engine asks for
+itself, five megabytes stay below 4 GB.
+
+**And the exam it was all for:** `-memstress:GB` asks `CryMalloc` for gigabytes once a level is
+up, writes every page and reads it back. 6 GB, 1536 of 1536 blocks, all above 4 GB, none
+corrupted, process at 8.6 GB, level still playable. The same run with `-noenginefix` crashes in
+CrySystem before the level loads.
+
+**Still open here:** raising the engine's own pools does not make the game use that room -
+textures at 3072 MB and a level still wants 2.4 GB, because the content is not there. The room
+is for what gets added.
 
 ## Cosmetic
 

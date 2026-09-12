@@ -393,6 +393,52 @@ files). Comparing pak sizes settles that in seconds instead of a debugging sessi
 Nothing user-identifying is collected: no user name, no profile paths, no serials, no network
 information.
 
+## Is it really a 64-bit build
+
+A 64-bit executable that never puts a byte above the 4 GB line is 64-bit in file format only.
+Two flags settle the question, and the answer is on the record rather than assumed.
+
+`-topdown` places every large allocation at the top of the address space, where losing the upper
+half of a pointer is fatal instead of harmless. `-memstress:GB` is the examination: once a level
+is loaded it asks `CryMalloc` - the retail bucket allocator, the one carrying eight truncating
+stores in every module - for that many gigabytes in 4 MB blocks, writes a pattern into every page
+and reads all of it back. A pointer that lost its top half cannot survive that: the block gets
+written at one address and read at another.
+
+```
+.\launcher64.exe -topdown -memstress:4 +map TimesSquare
+```
+
+```
+memstress: 1024 of 1024 blocks (4096 MB), 1024 above 4 GB, 0 corrupted
+census now 1699 MB low / 4823 MB high
+750 ms to fill, and the game is still running
+```
+
+Six gigabytes works the same way, with the process past 8.6 GB and the level still playable. The
+same run with `-noenginefix` crashes inside CrySystem before the level loads, which is the
+control this needed.
+
+Raising the engine's own pools does not produce that memory on its own - textures at 3072 MB,
+particle and mesh pools raised, and a level still only wants 2.4 GB. The game does not have that
+much content. What 64-bit buys is the room to add it.
+
+### What is left below the line, and why it is not ours
+
+The census shows around 1.6 GB still under 4 GB, and it is worth saying plainly what that is,
+because the obvious reading - "the work is a third done" - is wrong.
+
+Every large block the allocation hook sees now goes high: 56 of 56 on a level, with 5 MB of
+rounding left low. What remains below is 59 slabs of 8 to 32 MB whose addresses the hook never
+handed out. They are fully committed and never written - 0 of 256 probes across each one - and
+at least one carries `PAGE_WRITECOMBINE`, the protection used for memory a GPU writes through.
+No module of the game contains a direct syscall stub, so nothing is bypassing the hook in user
+mode; `NtAllocateVirtualMemoryEx` is hooked too and is never called. These are mapped by the
+kernel for the display driver, and their address is not ours to choose.
+
+So the honest figure is not "30 percent of memory is high". It is: of the memory the engine asks
+for itself, what stays below 4 GB is five megabytes.
+
 ## Testing without playing
 
 Catching a crash by hand costs an evening: the game has to be played until it dies, and the
@@ -422,6 +468,16 @@ Downtown       ok          25      71   0
 CentralStation ok          24      71   0
 ...
 ```
+
+Flags added along the way, all off unless asked for:
+
+| Flag | What it does |
+|---|---|
+| `-topdown[:KB]` | large allocations to the top of the address space; the exam |
+| `-memstress:GB` | ask the engine's allocator for that much, check every page |
+| `-heaphigh[:KB]` | large heap blocks out of the process heap (548 a level, 1128 MB) |
+| `-topmap` | file views high as well; counted either way |
+| `-memdebug` | the per-event memory diagnostics, which are noisy |
 
 `memmap.ps1` answers the other question - whether a running build is really using 64-bit memory:
 
