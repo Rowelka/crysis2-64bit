@@ -1701,6 +1701,71 @@ static PFN_CapStack g_capStack = 0;
 
 static void ReportAllocatorHeads(void);
 static int  CheckAllocatorIntegrity(void);
+
+// Which build of the game the corrections were measured against.
+//
+// Every patch in here names exact bytes at exact offsets inside these five modules. On another
+// build they simply do not match, nothing is written, and the game runs as if this launcher were
+// not here - which is safe but silent, and silence is how a player ends up with the old crashes
+// and no idea why. So the sizes are checked at startup and the answer is said out loud.
+//
+// File size rather than a hash: it separates builds just as well, costs nothing, and does not
+// need eleven megabytes read before the game starts. Crysis 2 has not been patched since 2012,
+// so this list is a fixed target rather than a maintenance burden.
+typedef struct { const char* name; unsigned long bytes; } KnownModule;
+
+static const KnownModule kSupportedBuild[] = {
+	{ "CrySystem.dll",      5225768 },
+	{ "CrySoundSystem.dll",  827688 },
+	{ "CryRenderD3D11.dll", 3493160 },
+	{ "CryScriptSystem.dll", 652584 },
+	{ "CryGameReal.dll",   11156264 },
+};
+
+static bool g_buildRecognised = true;
+
+static void CheckGameBuild(void)
+{
+	char line[260];
+	int mismatched = 0;
+
+	for (int i = 0; i < (int)(sizeof(kSupportedBuild) / sizeof(kSupportedBuild[0])); i++)
+	{
+		char path[MAX_PATH];
+		sprintf(path, "Bin64\\%s", kSupportedBuild[i].name);
+
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad))
+		{
+			int n = sprintf(line, "  build: %s is missing%s", kSupportedBuild[i].name, "\n");
+			AppendFaultLog(line, (unsigned long)n);
+			mismatched++;
+			continue;
+		}
+
+		const unsigned long got = fad.nFileSizeLow;
+		if (got != kSupportedBuild[i].bytes)
+		{
+			int n = sprintf(line, "  build: %s is %lu bytes, the corrections were measured "
+			                "against %lu%s", kSupportedBuild[i].name, got,
+			                kSupportedBuild[i].bytes, "\n");
+			AppendFaultLog(line, (unsigned long)n);
+			mismatched++;
+		}
+	}
+
+	g_buildRecognised = (mismatched == 0);
+
+	int n;
+	if (g_buildRecognised)
+		n = sprintf(line, "  build: recognised - all five modules match the supported build "
+		            "(1.1.1.217)%s", "\n");
+	else
+		n = sprintf(line, "  build: NOT the build these corrections were made for (%d module(s) "
+		            "differ). The game will run, but the pointer corrections will not apply and "
+		            "memory stays below 4 GB%s", mismatched, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
 static const char* WhyNotSafeForHighMemory(void);
 static bool g_engineFixFailed = false;
 
@@ -5314,6 +5379,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		HANDLE th = CreateThread(NULL, 0, SoundFixThread, NULL, 0, &tid);
 		if (th) CloseHandle(th);
 	}
+
+	CheckGameBuild();
 
 	// The hooks themselves cost nothing while steering is off - one trampoline, one branch per
 	// allocation - and they have to be in before the engine starts asking for memory, because a
