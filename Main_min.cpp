@@ -1639,6 +1639,7 @@ static volatile LONG     g_mapHigh       = 0;
 static volatile LONGLONG g_mapKb         = 0;
 static volatile LONGLONG g_mapHighKb     = 0;
 static bool              g_topMap        = false;
+static bool              g_memDebug      = false;   // -memdebug: the noisy part of the above
 
 // Who is holding the memory down. Counting calls says how much was left alone and nothing about
 // who asked for it, and the answer decides where the next hook goes: a module with its own page
@@ -1662,9 +1663,64 @@ static PFN_CapStack g_capStack = 0;
 
 static volatile LONG g_sampleCount = 0;
 
+// Everything the hook sees, before any filter at all. The counters that follow all narrow the
+// field, and if the total here does not account for the memory on the census, then the memory is
+// not coming through this call and no amount of work on the filters will find it.
+static volatile LONG     g_sawCalls    = 0;
+static volatile LONGLONG g_sawLowKb    = 0;
+static volatile LONGLONG g_sawHighKb   = 0;
+static volatile LONG     g_sawOtherPid = 0;
+static volatile LONG g_lowLandCount = 0;
+
+// Something large that ended up below 4 GB anyway, named on the spot. The counters say how much
+// is down there and the census says it arrives in 32 MB pieces; this says who asked for one.
+static void LowLandingSample(unsigned long long addr, SIZE_T bytes, ULONG type)
+{
+	if (!g_memDebug) return;
+	if (addr == 0 || addr > 0xFFFFFFFFull || bytes < 4 * 1024 * 1024) return;
+	if (InterlockedIncrement(&g_lowLandCount) > 8) return;
+	if (!g_capStack) return;
+
+	void* frames[14];
+	const USHORT n = g_capStack(1, 14, frames, NULL);
+	unsigned long long site = 0;
+	for (USHORT i = 0; i < n; i++)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)frames[i];
+		bool through = false;
+		for (int k = 0; k < g_passCount; k++)
+			if (a >= g_passLo[k] && a < g_passHi[k]) { through = true; break; }
+		if (!through) { site = a; break; }
+	}
+
+	char who[80];
+	if (!site) strcpy(who, "(never left ntdll)");
+	else
+	{
+		HMODULE mod = 0;
+		if (GetModuleHandleExA(0x00000004 | 0x00000002, (LPCSTR)(ULONG_PTR)site, &mod) && mod)
+		{
+			char full[MAX_PATH];
+			if (GetModuleFileNameA(mod, full, MAX_PATH))
+			{
+				const char* b = strrchr(full, 0x5C);
+				sprintf(who, "%s+0x%llX", b ? b + 1 : full,
+				        site - (unsigned long long)(ULONG_PTR)mod);
+			}
+			else sprintf(who, "0x%llX", site);
+		}
+		else sprintf(who, "0x%llX (no module)", site);
+	}
+
+	char line[220];
+	int m = sprintf(line, "  landed low: %llu MB at 0x%llX, type 0x%lX, asked by %s%s",
+	                (unsigned long long)(bytes / (1024 * 1024)), addr, type, who, "\n");
+	AppendFaultLog(line, (unsigned long)m);
+}
+
 static void SampleCall(PVOID* base, SIZE_T bytes, ULONG type)
 {
-	if (bytes < 1024 * 1024) return;
+	if (!g_memDebug || bytes < 1024 * 1024) return;
 	if (InterlockedIncrement(&g_sampleCount) > 10) return;
 
 	char line[200];
@@ -1760,6 +1816,139 @@ static LPVOID WINAPI TopDownVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, D
 	return p;
 }
 
+// -heaphigh: large blocks out of the process heap and into memory of our own, which -topdown
+// then places above 4 GB.
+//
+// The measurement that led here: the hook on NtAllocateVirtualMemory sees 853 MB a level, and
+// the census finds 1597 MB sitting below 4 GB in 32 MB pieces. The heap does not reserve those
+// through the stub we patched, so no filter on that call was ever going to catch them. What the
+// heap does do is hand out blocks, and every module asks for them through an import - HeapAlloc
+// in kernel32, which msvcr90's malloc calls directly.
+//
+// A redirected block is our own VirtualAlloc with a 64-byte header in front of it. Recognising
+// one on the way back is two tests: VirtualAlloc is granular to 64 KB, so a pointer of ours is
+// always 64 bytes past a 64 KB boundary, and the header carries a magic word. A block from the
+// real heap fails the first test almost always and the second one always.
+typedef LPVOID (WINAPI *PFN_HeapAlloc)(HANDLE, DWORD, SIZE_T);
+typedef LPVOID (WINAPI *PFN_HeapReAlloc)(HANDLE, DWORD, LPVOID, SIZE_T);
+typedef BOOL   (WINAPI *PFN_HeapFree)(HANDLE, DWORD, LPVOID);
+typedef SIZE_T (WINAPI *PFN_HeapSize)(HANDLE, DWORD, LPCVOID);
+
+static PFN_HeapAlloc   g_origHeapAlloc   = 0;
+static PFN_HeapReAlloc g_origHeapReAlloc = 0;
+static PFN_HeapFree    g_origHeapFree    = 0;
+static PFN_HeapSize    g_origHeapSize    = 0;
+
+static SIZE_T g_heapHighMin = 1024 * 1024;      // -heaphigh:KB
+static bool   g_heapHigh    = false;
+
+static volatile LONG     g_hhBlocks = 0;        // redirected and still out there
+static volatile LONG     g_hhTotal  = 0;
+static volatile LONGLONG g_hhKb     = 0;
+static volatile LONGLONG g_hhLiveKb = 0;
+static volatile LONG     g_hhFailed = 0;
+
+#define HH_HEADER 64
+#define HH_MAGIC  0x48494748504D454DULL          /* MEMPHGIH */
+
+static bool HighBlock(LPVOID p)
+{
+	if (!p) return false;
+	if ((((ULONG_PTR)p) & 0xFFFF) != HH_HEADER) return false;
+	return *(volatile unsigned long long*)((unsigned char*)p - HH_HEADER) == HH_MAGIC;
+}
+
+static SIZE_T HighBlockSize(LPVOID p)
+{
+	return (SIZE_T)*(volatile unsigned long long*)((unsigned char*)p - HH_HEADER + 8);
+}
+
+static LPVOID HighAlloc(SIZE_T size)
+{
+	unsigned char* raw = (unsigned char*)VirtualAlloc(NULL, size + HH_HEADER,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (!raw)
+	{
+		InterlockedIncrement(&g_hhFailed);
+		return NULL;
+	}
+	*(unsigned long long*)raw = HH_MAGIC;
+	*(unsigned long long*)(raw + 8) = (unsigned long long)size;
+
+	InterlockedIncrement(&g_hhBlocks);
+	InterlockedIncrement(&g_hhTotal);
+	InterlockedExchangeAdd64(&g_hhKb, (LONGLONG)(size / 1024));
+	InterlockedExchangeAdd64(&g_hhLiveKb, (LONGLONG)(size / 1024));
+	return raw + HH_HEADER;
+}
+
+static LPVOID WINAPI HighHeapAlloc(HANDLE heap, DWORD flags, SIZE_T size)
+{
+	if (g_heapHigh && size >= g_heapHighMin)
+	{
+		LPVOID p = HighAlloc(size);              // VirtualAlloc hands back zeroed pages already
+		if (p) return p;
+	}
+	return g_origHeapAlloc(heap, flags, size);
+}
+
+static BOOL WINAPI HighHeapFree(HANDLE heap, DWORD flags, LPVOID p)
+{
+	if (HighBlock(p))
+	{
+		const SIZE_T was = HighBlockSize(p);
+		unsigned char* raw = (unsigned char*)p - HH_HEADER;
+		*(unsigned long long*)raw = 0;           // so a double free is not mistaken for a block
+		InterlockedDecrement(&g_hhBlocks);
+		InterlockedExchangeAdd64(&g_hhLiveKb, -(LONGLONG)(was / 1024));
+		return VirtualFree(raw, 0, MEM_RELEASE);
+	}
+	return g_origHeapFree(heap, flags, p);
+}
+
+static SIZE_T WINAPI HighHeapSize(HANDLE heap, DWORD flags, LPCVOID p)
+{
+	if (HighBlock((LPVOID)p)) return HighBlockSize((LPVOID)p);
+	return g_origHeapSize(heap, flags, p);
+}
+
+static LPVOID WINAPI HighHeapReAlloc(HANDLE heap, DWORD flags, LPVOID p, SIZE_T size)
+{
+	const bool mine = HighBlock(p);
+
+	if (mine)
+	{
+		const SIZE_T was = HighBlockSize(p);
+		if (size <= was) return p;               // shrinking in place, the slack is ours to keep
+		if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return NULL;
+
+		LPVOID fresh = HighAlloc(size);
+		if (!fresh) return NULL;
+		memcpy(fresh, p, was);
+		HighHeapFree(heap, flags, p);
+		return fresh;
+	}
+
+	// Growing a heap block past the threshold: move it out of the heap while it is small enough
+	// to copy cheaply.
+	if (g_heapHigh && p && size >= g_heapHighMin && !(flags & HEAP_REALLOC_IN_PLACE_ONLY))
+	{
+		const SIZE_T was = g_origHeapSize(heap, flags, p);
+		if (was != (SIZE_T)-1 && was < size)
+		{
+			LPVOID fresh = HighAlloc(size);
+			if (fresh)
+			{
+				memcpy(fresh, p, was);
+				g_origHeapFree(heap, flags, p);
+				return fresh;
+			}
+		}
+	}
+
+	return g_origHeapReAlloc(heap, flags, p, size);
+}
+
 // Replaces every import that currently points at 'from'. Matching by address rather than by name
 // catches the api-ms-win-core-memory forwarders as well, which is what most of these DLLs import.
 static int RedirectImportsByAddress(HMODULE mod, void* from, void* to)
@@ -1816,6 +2005,22 @@ static int HookTopDownEverywhere(void)
 	int done = 0;
 	for (unsigned i = 0; i < n; i++)
 		done += RedirectImportsByAddress(mods[i], (void*)g_origVA, (void*)TopDownVirtualAlloc);
+
+	if (g_heapHigh && g_origHeapAlloc)
+		for (unsigned i = 0; i < n; i++)
+		{
+			// The launcher's own imports are left alone: the redirected functions call the
+			// originals through these pointers, and redirecting them would be a loop.
+			if (mods[i] == GetModuleHandleA(NULL)) continue;
+			done += RedirectImportsByAddress(mods[i], (void*)g_origHeapAlloc,
+			                                 (void*)HighHeapAlloc);
+			done += RedirectImportsByAddress(mods[i], (void*)g_origHeapFree,
+			                                 (void*)HighHeapFree);
+			done += RedirectImportsByAddress(mods[i], (void*)g_origHeapReAlloc,
+			                                 (void*)HighHeapReAlloc);
+			done += RedirectImportsByAddress(mods[i], (void*)g_origHeapSize,
+			                                 (void*)HighHeapSize);
+		}
 	return done;
 }
 
@@ -1825,10 +2030,81 @@ static bool g_topDown = false;
 // This is the number that says whether the engine is really using 64-bit memory: the count of
 // intercepted reservations does not, because most of the game's memory arrives another way -
 // file mappings for the .pak archives, and driver allocations for textures.
+// File views counted apart from private memory: they are a different call, a different hook and
+// a different question, and lumping them together hid a gigabyte of .pak under "low".
+static unsigned long long g_censusMapLow = 0, g_censusMapHigh = 0;
+
+// The shape of what is left below 4 GB. A thousand scattered 64 KB blocks and five 300 MB slabs
+// add up the same and need opposite fixes, so the census keeps the five largest reservations and
+// a count of how many there are.
+#define CENSUS_TOP 5
+static unsigned long long g_topBase[CENSUS_TOP], g_topSize[CENSUS_TOP];
+static unsigned long      g_topProt[CENSUS_TOP];
+static unsigned long      g_topParts[CENSUS_TOP];
+static unsigned long      g_lowSlabs = 0;
+static unsigned long long g_lowBySize[4];     // under 1 MB, 1-8, 8-32, 32 and over
+static unsigned long      g_lowCount[4];
+static unsigned long long g_lowReserved = 0;  // reserved below 4 GB, committed or not
+static unsigned long      g_lowResCount = 0;
+
+static void NoteLowRegion(unsigned long long base, unsigned long long bytes,
+                          unsigned long prot, unsigned long parts)
+{
+	if (!bytes) return;
+	g_lowSlabs++;
+
+	{
+		const int band = (bytes < 1024 * 1024)      ? 0 :
+		                 (bytes < 8 * 1024 * 1024)  ? 1 :
+		                 (bytes < 32 * 1024 * 1024) ? 2 : 3;
+		g_lowBySize[band] += bytes;
+		g_lowCount[band]++;
+	}
+	for (int i = 0; i < CENSUS_TOP; i++)
+	{
+		if (bytes <= g_topSize[i]) continue;
+		for (int k = CENSUS_TOP - 1; k > i; k--)
+		{
+			g_topSize[k]  = g_topSize[k - 1];
+			g_topBase[k]  = g_topBase[k - 1];
+			g_topProt[k]  = g_topProt[k - 1];
+			g_topParts[k] = g_topParts[k - 1];
+		}
+		g_topSize[i] = bytes;
+		g_topBase[i] = base;
+		g_topProt[i] = prot;
+		g_topParts[i] = parts;
+		return;
+	}
+}
+
+static void MemoryCensus(unsigned long long* lowMb, unsigned long long* highMb,
+                         unsigned long long* imageMb);
+
+static void CensusLine(const char* when)
+{
+	unsigned long long lo = 0, hi = 0, img = 0;
+	MemoryCensus(&lo, &hi, &img);
+	char line[200];
+	int n = sprintf(line, "  census (%s): %llu MB low in %lu reservation(s), %llu MB high, "
+	                "%llu MB modules, %llu MB reserved-not-committed low (%lu)%s",
+	                when, lo, g_lowSlabs, hi, img,
+	                g_lowReserved / (1024 * 1024), g_lowResCount, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
 static void MemoryCensus(unsigned long long* lowMb, unsigned long long* highMb,
                          unsigned long long* imageMb)
 {
 	unsigned long long low = 0, high = 0, image = 0;
+	g_censusMapLow = g_censusMapHigh = 0;
+	g_lowSlabs = 0;
+	for (int i = 0; i < CENSUS_TOP; i++) { g_topSize[i] = 0; g_topBase[i] = 0; }
+	for (int i = 0; i < 4; i++) { g_lowBySize[i] = 0; g_lowCount[i] = 0; }
+	g_lowReserved = 0;
+	g_lowResCount = 0;
+	unsigned long long runBase = 0, runBytes = 0;
+	unsigned long runProt = 0, runParts = 0;
 	MEMORY_BASIC_INFORMATION mbi;
 	unsigned long long at = 0x10000;
 
@@ -1837,11 +2113,41 @@ static void MemoryCensus(unsigned long long* lowMb, unsigned long long* highMb,
 		if (!VirtualQuery((LPCVOID)(ULONG_PTR)at, &mbi, sizeof(mbi))) break;
 
 		const unsigned long long size = (unsigned long long)mbi.RegionSize;
+
+		if (mbi.State == MEM_RESERVE && at < 0x100000000ull && mbi.Type == MEM_PRIVATE)
+		{
+			g_lowReserved += size;
+			g_lowResCount++;
+		}
+
 		if (mbi.State == MEM_COMMIT)
 		{
 			if (mbi.Type == MEM_IMAGE) image += size;
 			else if (at >= 0x100000000ull) high += size;
 			else low += size;
+
+			if (mbi.Type == MEM_MAPPED)
+			{
+				if (at >= 0x100000000ull) g_censusMapHigh += size;
+				else                      g_censusMapLow  += size;
+			}
+
+			// Group the committed parts of one reservation together: a heap segment shows up as
+			// a dozen regions with the same allocation base and is one thing, not a dozen.
+			if (mbi.Type == MEM_PRIVATE && at < 0x100000000ull)
+			{
+				const unsigned long long ab = (unsigned long long)(ULONG_PTR)mbi.AllocationBase;
+				if (ab != runBase)
+				{
+					NoteLowRegion(runBase, runBytes, runProt, runParts);
+					runBase = ab;
+					runBytes = 0;
+					runParts = 0;
+				}
+				runBytes += size;
+				runProt = mbi.Protect;
+				runParts++;
+			}
 		}
 
 		const unsigned long long next = at + size;
@@ -1850,6 +2156,7 @@ static void MemoryCensus(unsigned long long* lowMb, unsigned long long* highMb,
 		if (at >= 0x7FFFFFFF0000ull) break;
 	}
 
+	NoteLowRegion(runBase, runBytes, runProt, runParts);
 	*lowMb = low / (1024 * 1024);
 	*highMb = high / (1024 * 1024);
 	*imageMb = image / (1024 * 1024);
@@ -1962,9 +2269,17 @@ static LONG TryHighAt(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size
 	return -1;
 }
 
+static volatile LONG g_bigSeen = 0;
+
 static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBits,
                                      SIZE_T* size, ULONG type, ULONG protect)
 {
+	// Every large request as it arrives, before any filter. The census keeps finding 32 MB
+	// pieces below 4 GB that no counter here accounts for; this settles whether they come
+	// through this call at all.
+	const bool bigOne = g_memDebug && size && *size >= 8 * 1024 * 1024 &&
+	                    InterlockedIncrement(&g_bigSeen) <= 60;
+
 	const bool steer = base && (*base == NULL) && size && (*size >= g_topDownMin) &&
 	                   ((type & (MEM_RESERVE | MEM_COMMIT)) != 0) &&
 	                   (proc == (HANDLE)(LONG_PTR)-1);
@@ -2004,6 +2319,14 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 		if (st >= 0)
 		{
 			const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+
+			if (bigOne)
+			{
+				char bl[190];
+				int bn = sprintf(bl, "  big got: %llu MB at 0x%llX, steered%s",
+				                 (unsigned long long)(*size / (1024 * 1024)), a, "\n");
+				AppendFaultLog(bl, (unsigned long)bn);
+			}
 			InterlockedIncrement(&g_topDownCalls);
 			if (a > 0xFFFFFFFFull)
 			{
@@ -2022,6 +2345,28 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 	}
 
 	st = g_origNtAlloc(proc, base, zeroBits, size, type, protect);
+
+	if (st >= 0 && base && *base && size)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+
+		if (bigOne)
+		{
+			char bl[190];
+			int bn = sprintf(bl, "  big got: %llu MB at 0x%llX, type 0x%lX%s",
+			                 (unsigned long long)(*size / (1024 * 1024)), a, type, "\n");
+			AppendFaultLog(bl, (unsigned long)bn);
+		}
+
+		InterlockedIncrement(&g_sawCalls);
+		if (proc != (HANDLE)(LONG_PTR)-1) InterlockedIncrement(&g_sawOtherPid);
+		if (a > 0xFFFFFFFFull)
+			InterlockedExchangeAdd64(&g_sawHighKb, (LONGLONG)(*size / 1024));
+		else
+			InterlockedExchangeAdd64(&g_sawLowKb, (LONGLONG)(*size / 1024));
+
+		LowLandingSample(a, *size, type);
+	}
 
 	if (steer && st >= 0 && base && *base)
 	{
@@ -2053,6 +2398,18 @@ static LONG __stdcall CountedNtMapView(HANDLE section, HANDLE proc, PVOID* base,
 	if (ours && st >= 0 && *base && *viewSize)
 	{
 		const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+
+		// Large views as they land. The census keeps finding 8-32 MB pieces below 4 GB that the
+		// allocation hook never sees; if they are mapped rather than allocated, they show here.
+		static volatile LONG seen = 0;
+		if (g_memDebug && *viewSize >= 8 * 1024 * 1024 && InterlockedIncrement(&seen) <= 12)
+		{
+			char ml[190];
+			int mn = sprintf(ml, "  big view: %llu MB at 0x%llX, type 0x%lX, protect 0x%lX%s",
+			                 (unsigned long long)(*viewSize / (1024 * 1024)), a, type, protect,
+			                 "\n");
+			AppendFaultLog(ml, (unsigned long)mn);
+		}
 		const LONGLONG kb = (LONGLONG)(*viewSize / 1024);
 		InterlockedIncrement(&g_mapCalls);
 		InterlockedExchangeAdd64(&g_mapKb, kb);
@@ -2100,6 +2457,122 @@ static const char* HookNtMapView(void)
 	return "applied";
 }
 
+// The newer call, and on Windows 11 the one that matters. The segment heap - which is what a
+// process gets by default there - reserves through NtAllocateVirtualMemoryEx, not through the
+// call every tutorial hooks. It takes extended parameters instead of ZeroBits, so nothing about
+// it can be shared with the older hook, and a build that only hooks the old one sees a hundred
+// and seventy 32 MB reservations appear below 4 GB with no caller to blame.
+typedef LONG (__stdcall *PFN_NtAllocVMEx)(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG, PVOID, ULONG);
+static PFN_NtAllocVMEx   g_origNtAllocEx = 0;
+static volatile LONG     g_exCalls  = 0;
+static volatile LONG     g_exHigh   = 0;
+static volatile LONGLONG g_exHighKb = 0;
+static volatile LONGLONG g_exLowKb  = 0;
+
+static LONG TryHighAtEx(HANDLE proc, PVOID* base, SIZE_T* size, ULONG type, ULONG protect,
+                        PVOID ext, ULONG extCount)
+{
+	const SIZE_T want = *size;
+	type |= MEM_RESERVE;
+
+	LONGLONG step = (LONGLONG)((want + 0x1FFFF) & ~(SIZE_T)0xFFFF);
+	if (step < 0x100000LL) step = 0x100000LL;
+
+	for (int attempt = 0; attempt < 24; attempt++)
+	{
+		LONGLONG at = InterlockedExchangeAdd64(&g_highCursor, step);
+		if (at > 0x4000000000LL)
+		{
+			InterlockedExchange64(&g_highCursor, 0x200000000LL);
+			at = InterlockedExchangeAdd64(&g_highCursor, step);
+			if (at > 0x4000000000LL) return -1;
+		}
+
+		PVOID p = (PVOID)(ULONG_PTR)at;
+		SIZE_T sz = want;
+		const LONG st = g_origNtAllocEx(proc, &p, &sz, type, protect, ext, extCount);
+		if (st >= 0) { *base = p; *size = sz; return st; }
+	}
+	return -1;
+}
+
+static LONG __stdcall SteeredNtAllocEx(HANDLE proc, PVOID* base, SIZE_T* size, ULONG type,
+                                       ULONG protect, PVOID ext, ULONG extCount)
+{
+	const bool steer = g_topDown && base && (*base == NULL) && size &&
+	                   (*size >= g_topDownMin) &&
+	                   ((type & (MEM_RESERVE | MEM_COMMIT)) != 0) &&
+	                   (proc == (HANDLE)(LONG_PTR)-1) && !CalledByUnreadyModule();
+
+	LONG st;
+	if (steer && !g_topDownMax)
+	{
+		st = TryHighAtEx(proc, base, size, type, protect, ext, extCount);
+		if (st >= 0)
+		{
+			InterlockedIncrement(&g_exCalls);
+			InterlockedIncrement(&g_exHigh);
+			InterlockedExchangeAdd64(&g_exHighKb, (LONGLONG)(*size / 1024));
+			return st;
+		}
+		*base = NULL;
+	}
+	else if (steer)
+	{
+		type |= MEM_TOP_DOWN;
+	}
+
+	st = g_origNtAllocEx(proc, base, size, type, protect, ext, extCount);
+
+	if (st >= 0 && base && *base && size)
+	{
+		const unsigned long long a = (unsigned long long)(ULONG_PTR)*base;
+		InterlockedIncrement(&g_exCalls);
+		if (a > 0xFFFFFFFFull)
+		{
+			InterlockedIncrement(&g_exHigh);
+			InterlockedExchangeAdd64(&g_exHighKb, (LONGLONG)(*size / 1024));
+		}
+		else InterlockedExchangeAdd64(&g_exLowKb, (LONGLONG)(*size / 1024));
+	}
+	return st;
+}
+
+static const char* HookNtAllocEx(void)
+{
+	if (g_origNtAllocEx) return "already";
+
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	if (!nt) return "no ntdll";
+
+	unsigned char* at = (unsigned char*)GetProcAddress(nt, "NtAllocateVirtualMemoryEx");
+	if (!at) return "not on this Windows";
+
+	if (!(at[0] == 0x4C && at[1] == 0x8B && at[2] == 0xD1 && at[3] == 0xB8))
+		return "unfamiliar stub";
+
+	unsigned char* cave = AllocCaveNear(at);
+	if (!cave) return "no cave";
+
+	memcpy(cave, at, 8);
+	cave[8] = 0xE9;
+	{
+		const long rel = (long)((at + 8) - (cave + 13));
+		memcpy(cave + 9, &rel, 4);
+	}
+	g_origNtAllocEx = (PFN_NtAllocVMEx)cave;
+
+	unsigned char* pad = cave + 32;
+	pad[0] = 0xFF; pad[1] = 0x25; pad[2] = 0x00; pad[3] = 0x00; pad[4] = 0x00; pad[5] = 0x00;
+	{
+		void* target = (void*)SteeredNtAllocEx;
+		memcpy(pad + 6, &target, 8);
+	}
+
+	if (!WriteJump(at, pad, 8)) { g_origNtAllocEx = 0; return "jump failed"; }
+	return "applied";
+}
+
 static const char* HookNtAlloc(void)
 {
 	if (g_origNtAlloc) return "already";
@@ -2140,6 +2613,78 @@ static const char* HookNtAlloc(void)
 	return "applied";
 }
 
+// Large private regions below 4 GB, noticed the second they appear. Every hook we have says
+// these are not being allocated through it, so the remaining question is when they show up: the
+// launcher's clock and the engine's log share a wall clock, and whatever the engine was doing at
+// that second is the thing that made them.
+#define SLAB_WATCH 192
+static unsigned long long g_knownSlab[SLAB_WATCH];
+static int                g_knownSlabs = 0;
+static volatile LONG      g_slabsLogged = 0;
+
+static void WatchNewSlabs(unsigned elapsed)
+{
+	if (!g_memDebug) return;
+
+	MEMORY_BASIC_INFORMATION mbi;
+	unsigned long long at = 0x10000;
+
+	for (int guard = 0; guard < 200000; guard++)
+	{
+		if (at >= 0x100000000ull) break;
+		if (!VirtualQuery((LPCVOID)(ULONG_PTR)at, &mbi, sizeof(mbi))) break;
+
+		const unsigned long long size = (unsigned long long)mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && size >= 8 * 1024 * 1024)
+		{
+			const unsigned long long ab = (unsigned long long)(ULONG_PTR)mbi.AllocationBase;
+			bool known = false;
+			for (int i = 0; i < g_knownSlabs; i++)
+				if (g_knownSlab[i] == ab) { known = true; break; }
+
+			if (!known)
+			{
+				if (g_knownSlabs < SLAB_WATCH) g_knownSlab[g_knownSlabs++] = ab;
+				if (InterlockedIncrement(&g_slabsLogged) <= 60)
+				{
+					// What is in it. Pixels look like noise, a pool that has not been used yet
+					// is zeros, and engine structures are pointers - which are recognisable on
+					// sight, since every module of this game sits below 4 GB.
+					unsigned long long a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+					unsigned nonzero = 0;
+					{
+						const unsigned long long mid = ab + size / 2;
+						SafePeek((void*)(ULONG_PTR)ab, (ULONG_PTR*)&a0);
+						SafePeek((void*)(ULONG_PTR)(ab + 0x1000), (ULONG_PTR*)&a1);
+						SafePeek((void*)(ULONG_PTR)mid, (ULONG_PTR*)&a2);
+						SafePeek((void*)(ULONG_PTR)(mid + 0x800), (ULONG_PTR*)&a3);
+
+						for (unsigned s = 0; s < 256; s++)
+						{
+							ULONG_PTR v = 0;
+							if (!SafePeek((void*)(ULONG_PTR)(ab + (unsigned long long)s * 0x2000),
+							              &v)) break;
+							if (v) nonzero++;
+						}
+					}
+
+					char sl[240];
+					int sn = sprintf(sl, "  new slab: %llu MB at 0x%llX, %u s in, prot 0x%lX, "
+					                 "%u/256 used, %llX %llX %llX %llX%s",
+					                 size / (1024 * 1024), ab, elapsed,
+					                 (unsigned long)mbi.Protect, nonzero, a0, a1, a2, a3,
+					                 "\n");
+					AppendFaultLog(sl, (unsigned long)sn);
+				}
+			}
+		}
+
+		const unsigned long long next = at + size;
+		if (next <= at) break;
+		at = next;
+	}
+}
+
 // Keeps every table current, and says what the checks turned away.
 //
 // Modules map long after the first patch goes in - CryGameReal among them - and a module missing
@@ -2158,6 +2703,10 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 		const unsigned step = (i < 60) ? 1 : 5;
 		Sleep(step * 1000);
 		elapsed += step;
+
+		// Watched whatever the flags say: the question is whether these regions are something
+		// this launcher causes or something the game does anyway.
+		WatchNewSlabs(elapsed);
 
 		if (g_topDown)
 		{
@@ -2228,6 +2777,52 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 			int c = sprintf(line, "  memory: %llu MB low, %llu MB high (%llu%%), %llu MB modules%s",
 			                lowMb, highMb, totalMb ? (100 * highMb / totalMb) : 0, imageMb, "\n");
 			AppendFaultLog(line, (unsigned long)c);
+
+			{
+				const unsigned long long mapLo = g_censusMapLow / (1024 * 1024);
+				const unsigned long long mapHi = g_censusMapHigh / (1024 * 1024);
+				const unsigned long long prLo = (lowMb > mapLo) ? lowMb - mapLo : 0;
+				const unsigned long long prHi = (highMb > mapHi) ? highMb - mapHi : 0;
+				const unsigned long long prTot = prLo + prHi;
+				c = sprintf(line, "  of that: private %llu low / %llu high (%llu%%), "
+				            "views %llu low / %llu high%s",
+				            prLo, prHi, prTot ? (100 * prHi / prTot) : 0, mapLo, mapHi, "\n");
+				AppendFaultLog(line, (unsigned long)c);
+
+				c = sprintf(line, "  low reserved: %llu MB in %lu region(s) not committed%s",
+				            g_lowReserved / (1024 * 1024), g_lowResCount, "\n");
+				AppendFaultLog(line, (unsigned long)c);
+
+				c = sprintf(line, "  low by size: under 1MB %lu = %lluMB, 1-8MB %lu = %lluMB, "
+				            "8-32MB %lu = %lluMB, 32MB+ %lu = %lluMB%s",
+				            g_lowCount[0], g_lowBySize[0] / (1024 * 1024),
+				            g_lowCount[1], g_lowBySize[1] / (1024 * 1024),
+				            g_lowCount[2], g_lowBySize[2] / (1024 * 1024),
+				            g_lowCount[3], g_lowBySize[3] / (1024 * 1024), "\n");
+				AppendFaultLog(line, (unsigned long)c);
+
+				for (int q = 0; g_memDebug && q < CENSUS_TOP; q++)
+				{
+					if (!g_topSize[q]) continue;
+					unsigned long long peek0 = 0, peek1 = 0;
+					SafePeek((void*)(ULONG_PTR)g_topBase[q], (ULONG_PTR*)&peek0);
+					SafePeek((void*)(ULONG_PTR)(g_topBase[q] + 8), (ULONG_PTR*)&peek1);
+					c = sprintf(line, "  slab: 0x%llX %lluMB, prot 0x%lX, %lu part(s), starts 0x%llX 0x%llX%s",
+					            g_topBase[q], g_topSize[q] / (1024 * 1024), g_topProt[q],
+					            g_topParts[q], peek0, peek1, "\n");
+					AppendFaultLog(line, (unsigned long)c);
+				}
+
+				c = sprintf(line, "  low private: %lu reservation(s), largest "
+				            "0x%llX %lluMB, 0x%llX %lluMB, 0x%llX %lluMB, 0x%llX %lluMB, "
+				            "0x%llX %lluMB%s", g_lowSlabs,
+				            g_topBase[0], g_topSize[0] / (1024 * 1024),
+				            g_topBase[1], g_topSize[1] / (1024 * 1024),
+				            g_topBase[2], g_topSize[2] / (1024 * 1024),
+				            g_topBase[3], g_topSize[3] / (1024 * 1024),
+				            g_topBase[4], g_topSize[4] / (1024 * 1024), "\n");
+				AppendFaultLog(line, (unsigned long)c);
+			}
 		}
 
 		if (g_topDown)
@@ -2239,13 +2834,48 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 			                g_skipTooSmall,   g_skipSmallKb / 1024, "\n");
 			AppendFaultLog(line, (unsigned long)s);
 
+			if (g_memDebug)
+			{
+				HMODULE ntm = GetModuleHandleA("ntdll.dll");
+				const unsigned char* stub = ntm ?
+					(const unsigned char*)GetProcAddress(ntm, "NtAllocateVirtualMemory") : 0;
+				if (stub)
+				{
+					s = sprintf(line, "  stub now: %02X %02X %02X %02X %02X %02X %02X %02X%s",
+					            stub[0], stub[1], stub[2], stub[3],
+					            stub[4], stub[5], stub[6], stub[7], "\n");
+					AppendFaultLog(line, (unsigned long)s);
+				}
+			}
+
+			if (g_heapHigh)
+			{
+				s = sprintf(line, "  heaphigh: %ld block(s) moved out of the heap (%lld MB in total), "
+				            "%ld live (%lld MB), %ld refused%s",
+				            g_hhTotal, g_hhKb / 1024, g_hhBlocks, g_hhLiveKb / 1024,
+				            g_hhFailed, "\n");
+				AppendFaultLog(line, (unsigned long)s);
+			}
+
+			s = sprintf(line, "  hook saw: %ld call(s) reach the original, %lld MB landed low, "
+			            "%lld MB landed high, %ld for another process%s",
+			            g_sawCalls, g_sawLowKb / 1024, g_sawHighKb / 1024,
+			            g_sawOtherPid, "\n");
+			AppendFaultLog(line, (unsigned long)s);
+
+			s = sprintf(line, "  alloc-ex: %ld call(s), %ld above 4 GB (%lld MB), %lld MB low; "
+			            "%ld left low on purpose%s",
+			            g_exCalls, g_exHigh, g_exHighKb / 1024, g_exLowKb / 1024,
+			            g_highSkipped, "\n");
+			AppendFaultLog(line, (unsigned long)s);
+
 			s = sprintf(line, "  file views: %ld mapped (%lld MB), %ld above 4 GB (%lld MB)%s",
 			            g_mapCalls, g_mapKb / 1024, g_mapHigh, g_mapHighKb / 1024, "\n");
 			AppendFaultLog(line, (unsigned long)s);
 
 			// Who asked, biggest first. Anything under 16 MB is noise next to the gigabyte
 			// this is meant to explain.
-			for (int q = 0; q < CALLER_SLOTS; q++)
+			for (int q = 0; g_memDebug && q < CALLER_SLOTS; q++)
 			{
 				const LONGLONG site = g_callers[q].site;
 				if (!site || g_callers[q].kb < 16 * 1024) continue;
@@ -4139,6 +4769,7 @@ static void ExplainMissing(const char* what)
 // undecorated, so no name mangling is involved.
 static CreateSystemInterfaceFn LoadEngine(void)
 {
+	if (g_topDown) CensusLine("before CrySystem");
 	HMODULE engine = LoadLibraryA("CrySystem.dll");
 	if (!engine)
 	{
@@ -4320,17 +4951,49 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		if (strstr(lpCmdLine, "-topdown:max")) g_topDownMax = true;
 
 		if (strstr(lpCmdLine, "-topmap")) g_topMap = true;
+		if (strstr(lpCmdLine, "-memdebug")) g_memDebug = true;
 		PrepareAttribution();
+
+		// -heaphigh[:KB]: large heap blocks out of the process heap entirely. Where the memory
+		// below 4 GB actually is, measured rather than guessed.
+		if (strstr(lpCmdLine, "-heaphigh"))
+		{
+			const char* hh = strstr(lpCmdLine, "-heaphigh:");
+			if (hh)
+			{
+				const unsigned kb = (unsigned)atoi(hh + 10);
+				if (kb) g_heapHighMin = (SIZE_T)kb * 1024;
+			}
+
+			HMODULE k = GetModuleHandleA("kernel32.dll");
+			if (k)
+			{
+				g_origHeapAlloc   = (PFN_HeapAlloc)GetProcAddress(k, "HeapAlloc");
+				g_origHeapFree    = (PFN_HeapFree)GetProcAddress(k, "HeapFree");
+				g_origHeapReAlloc = (PFN_HeapReAlloc)GetProcAddress(k, "HeapReAlloc");
+				g_origHeapSize    = (PFN_HeapSize)GetProcAddress(k, "HeapSize");
+				g_heapHigh = g_origHeapAlloc && g_origHeapFree &&
+				             g_origHeapReAlloc && g_origHeapSize;
+			}
+
+			char hl[140];
+			int hn = sprintf(hl, "  heaphigh: %s, blocks of %u KB and up%s",
+			                 g_heapHigh ? "on" : "could not resolve kernel32",
+			                 (unsigned)(g_heapHighMin / 1024), "\n");
+			AppendFaultLog(hl, (unsigned long)hn);
+		}
 
 		const int hooked = HookTopDownEverywhere();
 		const char* deep = HookNtAlloc();
 		const char* maps = HookNtMapView();
+		const char* deepEx = HookNtAllocEx();
 		char line[224];
-		int n = sprintf(line, "  topdown: on, %d import(s) redirected, ntdll %s, views %s%s, "
-		                "threshold %u KB%s",
-		                hooked, deep, maps, g_topMap ? " (steered)" : " (counted)",
+		int n = sprintf(line, "  topdown: on, %d import(s) redirected, ntdll %s, ex %s, "
+		                "views %s%s, threshold %u KB%s",
+		                hooked, deep, deepEx, maps, g_topMap ? " (steered)" : " (counted)",
 		                (unsigned)(g_topDownMin / 1024), "\n");
 		AppendFaultLog(line, (unsigned long)n);
+		CensusLine("hooks in");
 		StartRangeKeeper();   // it re-hooks modules as they map
 	}
 
