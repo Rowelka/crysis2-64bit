@@ -401,6 +401,14 @@ why the default is three runs rather than one.
 | Intro videos render as white rectangles | Skipped by default. The decoder is present and is not the problem - see below. |
 | Co-op dialogue lines cut off and repeat | Not game-breaking. |
 | The engine reports 0 MB of video memory | Real, but no effect could be measured - see below. |
+| Some props do not appear, but still block you | Seen in a few spots (the AA-gun area on Bryant Park, parts of Prism2). The object is there - physics, collision, everything - only its geometry never arrives. Walk on and it does not follow you. |
+| A few textures stay unloaded | Same places, same cause. |
+| One screen shows the wrong image | The Hargreave monitor on Prism plays something else. |
+| A Screamer had no sound once | Not reproduced since. |
+
+The last four come from a full campaign playthrough on this launcher with memory steered high.
+None of them stop the run; they are listed because you will notice them and they are worth
+knowing about before you think something is wrong with your installation.
 
 **On the videos.** It is tempting to assume the 64-bit build has no video decoder. It has one:
 retail x64 `CrySystem.dll` carries a complete 64-bit CRI Sofdec build (`CRI Movie/PCx64 Ver.2.68`),
