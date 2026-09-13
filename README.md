@@ -7,6 +7,8 @@ complete set of **64-bit engine DLLs** - they were built for the Sandbox editor,
 game client was ever released. This launcher boots those x64 DLLs as a playable game client.
 
 The game is completable start to finish on this launcher (verified by an external tester).
+A fourteen-level campaign run has since been made in a single process with the allocator's
+memory steered above the 4 GB line, with every cutscene playing.
 
 > **Status:** working, but rough around the edges. See [Known issues](#known-issues).
 
@@ -201,7 +203,58 @@ there is a reason to touch it.
 
 ---
 
-### 5. Debug overlay and broken intro, off by default
+### 5. Cutscenes that freeze when memory goes high
+
+With the allocator's arenas steered above the 4 GB line, a level's opening cutscene would start
+and then stand still. The sequence was in the playing list, its length was read correctly, its
+speed was 1.0 - and its clock never advanced by a single frame. The scene never reported `Done`,
+so the level script waited forever and the player was left standing without a body. No crash, no
+log line, nothing to search for.
+
+The cause was this launcher's own workaround, not the engine. The guard that protects the movie
+update loop from corrupt entries (section 4 above) rejected every pointer whose high half was
+non-zero - a check that was correct when all of this game's memory really did sit below 4 GB.
+Once the arenas move up, a sequence pointer of `0x2_1CF88110` is perfectly valid, and the guard
+threw every one of them away, skipping the line that advances the clock.
+
+Both guards were rewritten: a pointer is now checked against the real user-mode range, and the
+module bounds are read from the module's own PE header instead of hard-coded constants.
+
+Measured as the distance the camera travels during the opening cutscene:
+
+| | Battery Park | FDR |
+|---|---|---|
+| before | 0.004 | - |
+| after | **4.816** / 4.766 | **5.875** |
+
+A full campaign run followed: fourteen levels in a single process with memory steered high,
+5.8 GB allocated above the 4 GB line, every cutscene playing.
+
+This also retired a workaround. A band of allocations between 14 and 16 MB used to be pinned
+below the line, because with it high the game broke. It was never a cure - it simply kept the
+sequence pointers where that broken guard would accept them. The band now goes high with
+everything else.
+
+---
+
+### 6. A renderer crash on level transitions
+
+Across a long campaign the renderer dies while copying a small struct of reference-counted
+pointers: one of them names an object that was released when a level unloaded, and its memory has
+since been handed out again. Seen twice, both times on a transition between levels, both times at
+the same instruction - once with two numbers sitting where a method table should be.
+
+The repair waits for the fault rather than guarding every copy. A guard has to decide, on every
+single copy, whether a pointer is alive - and a guard that decides wrongly is exactly what froze
+the cutscenes above. Instead, when the fault happens, the destination field is cleared and
+execution resumes at the next line, leaving the pointer empty rather than dead; the code right
+below tests it against null three times over.
+
+Pass `-norndfix` to disable it.
+
+---
+
+### 7. Debug overlay and broken intro, off by default
 
 Two things made the build look like a debug build rather than a game.
 
@@ -222,7 +275,7 @@ Both are set from the launcher's command line at startup:
 
 Pass `-keepintro` to restore the original behaviour, or set the CVars from the console.
 
-### 6. The invisible cursor, and the missing icon
+### 8. The invisible cursor, and the missing icon
 
 The game loads its cursor with `LoadCursorA` against the running executable, which with this
 project is the launcher rather than `Crysis2.exe`. The original executable carries those cursor

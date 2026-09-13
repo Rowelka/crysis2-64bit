@@ -102,7 +102,10 @@ static LONG CALLBACK MovieVEH(EXCEPTION_POINTERS* ep)
 {
 	if (ep && ep->ExceptionRecord && g_movieCave) {
 		unsigned long long caveLo = (unsigned long long)g_movieCave;
-		unsigned long long caveHi = caveLo + 128;
+		// The whole cave, not the 128 bytes the body used to fit in: widening the guards to
+		// full 64-bit comparisons pushed it past that, and a fault in the tail would have gone
+		// unhandled - the crashes this workaround exists to absorb.
+		unsigned long long caveHi = caveLo + 512;
 		unsigned long long rip = (unsigned long long)ep->ContextRecord->Rip;
 		// A: faulted inside the cave itself, dereferencing an element pointer that was unmapped.
 		if (rip >= caveLo && rip < caveHi) {
@@ -1927,17 +1930,19 @@ static char g_keepLowNames[KEEPLOW_SLOTS][40];
 static int  g_keepLowCount = 0;
 static bool g_highAction = false;   // -highaction: steer CryAction's memory too
 static bool g_gameLow    = false;   // -gamelow: leave the entire game layer low
-// The arena band stays low by default.
+// The arena band goes high like everything else. Off by default since 12.09.2026.
 //
-// Bisected on two levels through the menu: high memory breaks cutscenes and NPC spawns, a 16 MB
-// threshold does not, and every allocation in the band between is exactly 15 MB - asked for by
-// the renderer, physics, animation, 3DEngine and CrySystem alike. That is the allocator's arena.
-// Pinning just that band costs little and keeps the game correct: 1179 MB a level still goes
-// high, against 151 MB when the whole threshold is raised instead.
+// It used to be pinned low, and the bisection that put it there was sound as far as it went:
+// with the 14-16 MB band high the cutscenes broke, with it low they played. What the bisection
+// could not see is that the band was never the cause. The cause was our own guard in the
+// CryMovie update loop, which threw away every pointer whose high half was non-zero - see the
+// workaround near the bottom of this file. Keeping the arenas low simply kept the sequence
+// pointers below 4 GB, where that guard let them through.
 //
-// Moving the arenas above a terabyte was tried, in case the allocator's address-indexed table
-// was the problem. It was not: the game broke the same way.
-static unsigned g_bandLoKb = 14 * 1024, g_bandHiKb = 16 * 1024;   // -keepband:LO-HI, in MB
+// With the guard fixed, the band goes high and the cutscenes play: BatteryPark 4.816 and
+// FDR 5.875 on the camera-path probe, against 0.004 before. Pinning it now would cost address
+// space for nothing, so the default is off; -keepband:LO-HI still works for experiments.
+static unsigned g_bandLoKb = 0, g_bandHiKb = 0;   // -keepband:LO-HI, in MB (0 = off)
 static volatile LONG g_bandKept = 0;
 
 static void ParseKeepLow(const char* cmd)
@@ -2528,6 +2533,1249 @@ static bool CalledByUnreadyModule(void)
 	return false;
 }
 
+// -shadow - the trap that turns the silent breakage into a loud one.
+//
+// The arena band breaks the game without an exception and without a log line, which is the one
+// shape of failure none of our tools can see. Four auditors read the code looking for a
+// truncated pointer and found nothing, so this stops reading and starts catching.
+//
+// If a pointer to an arena loses its upper half somewhere, the access that follows goes to the
+// lower 32 bits of that address. So: reserve a strip of low address space and give it no
+// access, then place the arenas high at addresses whose lower 32 bits land inside that strip.
+// A lost upper half now touches a page that cannot be touched, and the fault names the exact
+// instruction that did it.
+//
+// The strip is kept below 0x80000000 on purpose: down there the sign-extended form of the
+// truncation (movsxd, which this engine does use) has the same value as the plain one, so a
+// single trap catches both shapes.
+//
+// A fault is healed rather than fatal - the page is committed and execution continues - so one
+// run lists every place that truncates instead of stopping at the first.
+static bool      g_shadowOn     = false;
+static SIZE_T    g_shadowMb     = 512;
+static ULONG_PTR g_shadowBase   = 0;
+static ULONG_PTR g_shadowEnd    = 0;
+static volatile LONGLONG g_shadowCursor = 0;
+static volatile LONG g_shadowFloor  = 2;    // 2 -> arenas start 8 GB up
+static volatile LONG g_shadowPlaced = 0;
+
+// The bottom 32 bits of every arena placed under the trap. A truncated copy of an arena pointer
+// equals one of these, or lands just inside one - so the hunt looks for exactly that instead of
+// for any value in the strip, which at 512 MB wide catches ordinary numbers by the hundred.
+#define SHADOW_ARENAS 512
+static unsigned long g_arenaLow[SHADOW_ARENAS];
+static volatile LONG g_arenaCount = 0;
+static SIZE_T        g_huntWindow = 64;     // -hunt:BYTES from the start of an arena
+
+// -arenamax:N - send only the first N arenas high, keep the rest low.
+//
+// Now that a run can be judged automatically, the question "which arena breaks it" can be
+// answered by halving. Arenas are handed out in the same order every load, so N is a stable
+// coordinate: find the smallest N that breaks the cutscene and the arena at that position is
+// the one, with its caller and its size already recorded.
+static long g_arenaMax  = -1;             // -1 = flag absent; 0 = every arena stays low
+static long g_arenaMin  = 1;              // -arenamin:N - the first arena allowed up
+static long g_arenaWatch = 0;             // -arenawatch:N - print the whole stack for this one
+
+// -arenaat:MB - put the watched arena at a chosen height, nothing else moved.
+//
+// The trap proved the pointer is not truncated, so the next candidate is a 32-bit OFFSET: code
+// that stores "how far is this from my base" in an int leaves no truncated address anywhere in
+// memory, yet stops finding the object once the distance passes two gigabytes. That predicts a
+// threshold, and a threshold can be measured: walk the arena up through 3, 4, 5, 6 GB and see
+// where the cutscene stops playing.
+static unsigned long long g_arenaAtMb = 0;
+static volatile LONG g_arenaNth = 0;
+
+static void NameCode(ULONG_PTR pc, char* out);   // defined with the shadow trap below
+static LONG TryShadowHigh(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size,
+                          ULONG type, ULONG protect);
+
+// Everything about one arena: who asked, from where, how big, where it went.
+//
+// Bisection named arena #37 out of forty. Two things are still open and this answers the first:
+// which code asks for that particular one. The second - whether #37 is special or whether
+// thirty-seven is simply one too many - is what -arenamin is for: shifting the window keeps the
+// count the same while changing which arenas are in it.
+static void ReportArena(long nth, SIZE_T bytes, ULONG_PTR where, const char* what)
+{
+	char line[600];
+	int n = sprintf(line, "  arena #%ld: %llu bytes -> 0x%llX (%s)%s", nth,
+	                (unsigned long long)bytes, (unsigned long long)where, what, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	void* frames[24];
+	const USHORT got = CaptureStackBackTrace(1, 24, frames, NULL);
+
+	for (USHORT f = 0; f < got; f++)
+	{
+		char who[220];
+		NameCode((ULONG_PTR)frames[f], who);
+
+		// Frames inside ntdll and the CRT are plumbing; the first name outside them is the
+		// caller that matters, but print them all - the shape of the stack is the evidence.
+		n = sprintf(line, "      [%2d] %s%s", (int)f, who, "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+}
+
+// -shadowdry: the control run. The strip is reserved and the arena addresses are computed and
+// recorded exactly as they would be, but the arenas themselves stay low, where the game is known
+// to work. Any value the hunt finds in this run is background - a constant, a size, a hash that
+// happens to look like an arena address. Only what shows up in the real run and NOT here can be
+// a truncated pointer. Without this the hunt cannot tell a finding from a coincidence.
+static bool g_shadowDry = false;
+static volatile LONG g_shadowHits   = 0;
+static volatile LONG g_shadowHealed = 0;
+
+// Instruction addresses already reported, so a fault inside a loop does not fill the file.
+#define SHADOW_SEEN 96
+static volatile LONGLONG g_shadowSeen[SHADOW_SEEN];
+static volatile LONG     g_shadowSeenCount = 0;
+
+static void NameCode(ULONG_PTR pc, char* out)
+{
+	HMODULE m = 0;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &m) && m)
+	{
+		char path[MAX_PATH];
+		if (GetModuleFileNameA(m, path, MAX_PATH))
+		{
+			const char* nm = path;
+			for (const char* s = path; *s; s++) if (*s == 92 || *s == 47) nm = s + 1;
+			sprintf(out, "%s+0x%llX", nm, (unsigned long long)(pc - (ULONG_PTR)m));
+			return;
+		}
+	}
+	sprintf(out, "0x%llX", (unsigned long long)pc);
+}
+
+static LONG CALLBACK ShadowVeh(EXCEPTION_POINTERS* ep)
+{
+	if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_ACCESS_VIOLATION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+
+	const ULONG_PTR op   = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[0];
+	const ULONG_PTR what = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
+
+	if (what < g_shadowBase || what >= g_shadowEnd) return EXCEPTION_CONTINUE_SEARCH;
+
+	InterlockedIncrement(&g_shadowHits);
+
+	const ULONG_PTR pc = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+
+	// Report each instruction once.
+	bool fresh = true;
+	const LONG have = g_shadowSeenCount;
+	for (LONG i = 0; i < have && i < SHADOW_SEEN; i++)
+		if ((ULONG_PTR)g_shadowSeen[i] == pc) { fresh = false; break; }
+
+	if (fresh && have < SHADOW_SEEN)
+	{
+		const LONG slot = InterlockedIncrement(&g_shadowSeenCount) - 1;
+		if (slot < SHADOW_SEEN)
+		{
+			g_shadowSeen[slot] = (LONGLONG)pc;
+
+			char who[200], line[460];
+			NameCode(pc, who);
+
+			// The caller above it: the truncating instruction often sits inside a shared
+			// allocator template, and the module that called it is the useful half.
+			char up[200];
+			up[0] = 0;
+			void* frames[8];
+			const USHORT n = CaptureStackBackTrace(0, 8, frames, NULL);
+			for (USHORT f = 0; f < n; f++)
+			{
+				if ((ULONG_PTR)frames[f] == pc) continue;
+				HMODULE fm = 0;
+				if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                        (LPCSTR)frames[f], &fm) || !fm) continue;
+				NameCode((ULONG_PTR)frames[f], up);
+				break;
+			}
+
+			int ln = sprintf(line, "  TRUNCATION: %s %s 0x%llX  (called from %s)%s",
+			                 who,
+			                 op == 1 ? "wrote" : (op == 8 ? "executed" : "read"),
+			                 (unsigned long long)what,
+			                 up[0] ? up : "?", "\n");
+			AppendFaultLog(line, (unsigned long)ln);
+		}
+	}
+
+	// Heal it: give the page real memory so the run carries on and the remaining truncations
+	// show themselves too. The data is zeroes, so the game behaves as it does today.
+	if (g_shadowHealed < 8192)
+	{
+		void* page = (void*)(what & ~(ULONG_PTR)0xFFF);
+		if (VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE))
+		{
+			InterlockedIncrement(&g_shadowHealed);
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// One contiguous strip of low address space, reserved and untouchable. Taken early, while the
+// engine has not claimed anything down there yet.
+static void ReserveShadowStrip(void)
+{
+	const SIZE_T want = g_shadowMb * 1024 * 1024;
+
+	// Deliberately not a round address. A strip starting at 0x10000000 makes every arena
+	// address look like an ordinary constant - 0x10000000 itself appears in engine data by the
+	// hundred - and the hunt drowns in them. Starting at an odd offset, with an odd stride,
+	// gives the arenas addresses that nothing else in the process happens to hold.
+	for (ULONG_PTR at = 0x11A30000; at + want < 0x78000000; at += 0x1730000)
+	{
+		void* got = VirtualAlloc((LPVOID)at, want, MEM_RESERVE, PAGE_NOACCESS);
+		if (got)
+		{
+			g_shadowBase   = (ULONG_PTR)got;
+			g_shadowEnd    = g_shadowBase + want;
+			g_shadowCursor = (LONGLONG)(g_shadowBase + 0x2F0000);
+			AddVectoredExceptionHandler(1, ShadowVeh);
+			return;
+		}
+	}
+}
+
+// An arena placed high, with its lower 32 bits inside the strip.
+static LONG TryShadowHigh(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size,
+                          ULONG type, ULONG protect)
+{
+	if (!g_shadowBase) return -1;
+
+	const SIZE_T want = *size;
+	LONGLONG step = (LONGLONG)((want + 0x1FFFF) & ~(SIZE_T)0xFFFF);
+	if (step < 0x100000LL) step = 0x100000LL;
+
+	type |= MEM_RESERVE;
+
+	for (int attempt = 0; attempt < 48; attempt++)
+	{
+		LONGLONG low = InterlockedExchangeAdd64(&g_shadowCursor, step);
+
+		// Ran off the end of the strip: start again at its base one floor higher, so the lower
+		// 32 bits repeat while the full addresses stay distinct.
+		if (low + step > (LONGLONG)g_shadowEnd)
+		{
+			InterlockedExchange64(&g_shadowCursor, (LONGLONG)g_shadowBase);
+			if (InterlockedIncrement(&g_shadowFloor) > 4000) return -1;
+			continue;
+		}
+
+		PVOID p = (PVOID)(ULONG_PTR)(((LONGLONG)g_shadowFloor << 32) + low);
+
+		// Control run: record the address, place nothing.
+		if (g_shadowDry)
+		{
+			const LONG slot = InterlockedIncrement(&g_shadowPlaced) - 1;
+			if (slot < SHADOW_ARENAS)
+			{
+				g_arenaLow[slot] = (unsigned long)((ULONG_PTR)p & 0xFFFFFFFFul);
+				InterlockedIncrement(&g_arenaCount);
+			}
+			return -1;
+		}
+
+		SIZE_T sz = want;
+		const LONG st = orig(proc, &p, 0, &sz, type, protect);
+		if (st >= 0)
+		{
+			*base = p;
+			*size = sz;
+			const LONG slot = InterlockedIncrement(&g_shadowPlaced) - 1;
+			if (slot < SHADOW_ARENAS)
+			{
+				g_arenaLow[slot] = (unsigned long)((ULONG_PTR)p & 0xFFFFFFFFul);
+				InterlockedIncrement(&g_arenaCount);
+			}
+			return st;
+		}
+	}
+	return -1;
+}
+
+// The second trap: hunting for the truncated value itself.
+//
+// The first trap catches a lost upper half only when something dereferences it. A pointer that
+// is merely compared - "is this the object I cached?" - answers no and the function quietly does
+// nothing, with no fault to catch. That is exactly the shape of the arena failure: no exception,
+// no log line, a cutscene that never starts.
+//
+// But the truncated value is still sitting in memory somewhere. And the shadow strip makes it
+// unmistakable: nothing is ever committed inside it, so any 64-bit word whose upper half is zero
+// and whose lower half points into the strip cannot be a real pointer. It can only be the
+// bottom of one of our arenas with its top half lost.
+//
+// So walk every committed page and look for exactly that. A hit names the address the truncated
+// copy lives at, which names the structure, which names the code that wrote it.
+static volatile LONG g_huntRuns  = 0;
+static volatile LONG g_huntFound = 0;
+
+// Where the modules live, so a hit can be reported as module+RVA rather than a bare address.
+static bool AddressInAModule(ULONG_PTR a, char* out)
+{
+	HMODULE m = 0;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m)
+	{
+		NameCode(a, out);
+		return true;
+	}
+	return false;
+}
+
+static void ScanOneRegion(ULONG_PTR from, SIZE_T bytes)
+{
+	__try
+	{
+		const ULONG_PTR lo = g_shadowBase, hi = g_shadowEnd;
+		const unsigned long long* w = (const unsigned long long*)from;
+		const SIZE_T words = bytes / 8;
+
+		for (SIZE_T i = 0; i < words; i++)
+		{
+			const unsigned long long v = w[i];
+
+			// Upper half gone, lower half inside the strip - and not just anywhere in it, but
+			// inside the first few kilobytes of an arena we actually placed. The strip alone is
+			// half a gigabyte wide and ordinary numbers fall into it constantly; an arena
+			// header is a target narrow enough that a hit means something.
+			if (v < (unsigned long long)lo || v >= (unsigned long long)hi) continue;
+
+			bool isArena = false;
+			const LONG have = g_arenaCount;
+			for (LONG a = 0; a < have && a < SHADOW_ARENAS; a++)
+			{
+				const unsigned long long ab = (unsigned long long)g_arenaLow[a];
+				if (v >= ab && v < ab + (unsigned long long)g_huntWindow) { isArena = true; break; }
+			}
+
+			if (isArena)
+			{
+				if (g_huntFound >= 40) return;
+				const LONG n = InterlockedIncrement(&g_huntFound);
+				if (n > 40) return;
+
+				const ULONG_PTR where = (ULONG_PTR)&w[i];
+
+				char site[200];
+				if (!AddressInAModule(where, site))
+					sprintf(site, "heap 0x%llX", (unsigned long long)where);
+
+				// What owns the structure this word sits in: the nearest word in a 128-byte
+				// window that points into a loaded module is usually its vtable.
+				char owner[200];
+				owner[0] = 0;
+				const unsigned long long* around = (const unsigned long long*)
+				                                 (where & ~(ULONG_PTR)7);
+				for (int k = -8; k <= 8 && !owner[0]; k++)
+				{
+					ULONG_PTR cand = 0;
+					if (!SafePeek(&around[k], &cand) || cand < 0x10000) continue;
+					if (cand == (ULONG_PTR)v) continue;
+					char nm[200];
+					if (AddressInAModule(cand, nm))
+						sprintf(owner, "%s at %+d", nm, k * 8);
+				}
+
+				char line[480];
+				int ln = sprintf(line, "  TRUNCATED PTR: %s holds 0x%llX (arena bottom), "
+				                 "owner %s%s",
+				                 site, (unsigned long long)v,
+				                 owner[0] ? owner : "unknown", "\n");
+				AppendFaultLog(line, (unsigned long)ln);
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+}
+
+static void HuntForTruncatedPointers(void)
+{
+	if (!g_shadowBase) return;
+	InterlockedIncrement(&g_huntRuns);
+
+	MEMORY_BASIC_INFORMATION mbi;
+	ULONG_PTR at = 0x10000;
+
+	for (int guard = 0; guard < 400000; guard++)
+	{
+		if (!VirtualQuery((LPCVOID)at, &mbi, sizeof(mbi))) break;
+
+		const ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
+		const SIZE_T    size = mbi.RegionSize;
+
+		const bool readable = (mbi.State == MEM_COMMIT) &&
+		                      ((mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+		                                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+		                                       PAGE_EXECUTE_WRITECOPY)) != 0) &&
+		                      ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0);
+
+		// Skip the strip itself and anything the trap healed inside it.
+		const bool isStrip = (base >= g_shadowBase && base < g_shadowEnd);
+
+		// Our own module holds the list being searched for.
+		HMODULE self = GetModuleHandleA(0);
+		const bool isSelf = (self && base >= (ULONG_PTR)self &&
+		                     base < (ULONG_PTR)self + 0x200000);
+
+		if (readable && !isStrip && !isSelf && size && size < 0x40000000)
+			ScanOneRegion(base, size);
+
+		const ULONG_PTR next = base + size;
+		if (next <= at) break;
+		at = next;
+		if (g_huntFound >= 40) break;
+	}
+}
+
+// -say:COMMAND - ask the running game something, in its own console.
+//
+// The arena failure has no automatic symptom: no exception, no missing log line, and the one
+// place a human sees it (a cutscene that never starts) does not happen under +map at all. But
+// the engine will answer questions if asked - the console is reachable from gEnv, and a Lua
+// line through it can print the number of entities the level actually created, which is the
+// other half of what the failure looks like: NPCs that never appear.
+//
+// The command is handed over with deferred execution, so the engine runs it on its own thread
+// at its own time rather than having it called into from ours.
+// Same global the camera trace uses, needed here first.
+#define GENV_RVA_IN_GAMEREAL 0xA0E8C0
+#define PCONSOLE_OFF         0xA0
+#define EXECUTESTRING_SLOT   33
+
+// -pakinfo: where the file-reading methods actually live.
+//
+// The read that quietly does nothing above 4 GB is called through a vtable - CrySystem+0xBEA84
+// is call [rdi+0x108], slot 33 of the file interface. Statically that is a dead end without
+// RTTI; live it is three reads: gEnv+0x50 is pCryPak, its first word is the vtable, and the
+// slots are function pointers into CrySystem. Printing them as RVAs makes the next step a
+// disassembly of a known address instead of a search.
+#define PCRYPAK_OFF 0x50
+static bool g_pakInfo = false;
+static bool g_saidPak = false;
+
+static char  g_sayWhat[400] = { 0 };
+static DWORD g_sayAfter     = 75;      // seconds; a level needs to be up first
+// How many times to repeat. Three samples tell a stuck sequence from a running one, but a
+// command with a side effect - "map downtown" - must be sent once and only once.
+static int   g_sayMax       = 3;       // -sayonce
+static DWORD g_sayEvery     = 10;      // -sayevery:N seconds between repeats
+static int   g_saidTimes   = 0;      // the same question three times, ten seconds apart
+
+typedef void (__fastcall *PFN_ExecuteString)(void*, const char*, bool, bool);
+
+static bool RunConsoleCommand(const char* cmd)
+{
+	HMODULE gr = GetModuleHandleA("CryGameReal.dll");
+	if (!gr) return false;
+
+	ULONG_PTR env = 0;
+	if (!SafePeek((unsigned char*)gr + GENV_RVA_IN_GAMEREAL, &env) || env < 0x10000)
+		return false;
+
+	ULONG_PTR con = 0;
+	if (!SafePeek((unsigned char*)env + PCONSOLE_OFF, &con) || con < 0x10000)
+		return false;
+
+	ULONG_PTR vt = 0;
+	if (!SafePeek((const void*)con, &vt) || vt < 0x10000) return false;
+
+	ULONG_PTR fn = 0;
+	if (!SafePeek((const void*)(vt + EXECUTESTRING_SLOT * 8), &fn) || fn < 0x10000)
+		return false;
+
+	__try
+	{
+		// silent = false so the answer reaches Game.log, deferred = true so the engine runs it
+		// where it runs everything else.
+		((PFN_ExecuteString)fn)((void*)con, cmd, false, true);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+	return true;
+}
+
+// Watching the XML buffer fill up - or not.
+//
+// The allocation that breaks the game turned out to be the XML reader's read buffer: CrySystem
+// asks for a block the size of the file, hands it to CryPak::FReadRaw, and parses what lands in
+// it. Everything up to that point is 64-bit clean - the pointer goes into r13 whole and reaches
+// the read call whole. So the question is whether the read actually fills it when it sits above
+// the 4 GB line, and that can be answered by looking: the first bytes of the level's object XML
+// are recognisable text.
+//
+// Reading someone else's buffer while they use it is safe here in the one way that matters - it
+// only reads, never writes - and the answer decides where to look next: an empty buffer means
+// the file read is the failure, a full one means the parser is.
+// -peekfind:WORD - is this word anywhere in the watched buffer?
+//
+// The sequences never get added, and the code that would add them gives up silently when the
+// XML has no "SequenceData" node. So the question is whether that part of the file ever reached
+// the buffer: if the word is there, the read was complete and the parser is at fault; if it is
+// missing, the file arrived truncated.
+static char g_peekFind[64] = { 0 };
+
+static volatile ULONG_PTR g_peekAt    = 0;
+static volatile SIZE_T    g_peekBytes = 0;
+
+static void DescribeBytes(const char* what, const unsigned char* at, char* out)
+{
+	// 24 bytes as hex, then the same as text with unprintables dotted - enough to tell XML from
+	// zeroes without dumping the file into the log.
+	int n = sprintf(out, "  peek %s: ", what);
+	for (int i = 0; i < 24; i++) n += sprintf(out + n, "%02X ", at[i]);
+	n += sprintf(out + n, " |");
+	for (int i = 0; i < 24; i++)
+		n += sprintf(out + n, "%c", (at[i] >= 32 && at[i] < 127) ? at[i] : '.');
+	sprintf(out + n, "|%s", "\n");
+}
+
+static DWORD WINAPI PeekThread(LPVOID)
+{
+	unsigned char first[24], last[24];
+	bool everFilled = false;
+	int  reads = 0, fails = 0;
+	bool saidGone = false;
+
+	for (int pass = 0; pass < 2000; pass++)
+	{
+		Sleep(50);
+
+		const ULONG_PTR at = g_peekAt;
+		const SIZE_T    sz = g_peekBytes;
+		if (!at || !sz) continue;
+
+		// Head and tail in separate guards: a reserved-but-not-yet-committed tail must not hide
+		// what the head says.
+		bool ok = true;
+		__try { memcpy(first, (const void*)at, 24); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+
+		__try { memcpy(last, (const void*)(at + sz - 32), 24); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { memset(last, 0xEE, 24); }
+
+		// Say where we are every ten seconds, so silence is never the answer.
+		if ((pass % 200) == 0)
+		{
+			char st[200];
+			int sn = sprintf(st, "  peek: pass %d, at 0x%llX, %d read(s), %d fail(s)%s",
+			                 pass, (unsigned long long)at, reads, fails, "\n");
+			AppendFaultLog(st, (unsigned long)sn);
+		}
+
+		if (!ok)
+		{
+			// The buffer is gone - freed after parsing, or never really there. Say so once,
+			// because "no output at all" reads the same as "the thread never ran".
+			fails++;
+			if (!saidGone && reads > 0)
+			{
+				saidGone = true;
+				char line[200];
+				int n = sprintf(line, "  peek: buffer unreadable after %d read(s), %s%s",
+				                reads, everFilled ? "it had been filled" : "IT WAS NEVER FILLED",
+				                "\n");
+				AppendFaultLog(line, (unsigned long)n);
+			}
+			continue;
+		}
+
+		reads++;
+
+		// Look for the word that decides the question, over the whole block.
+		if (g_peekFind[0] && (pass % 40) == 0)
+		{
+			const int want = (int)strlen(g_peekFind);
+			SIZE_T found = 0, hits = 0;
+			__try
+			{
+				const char* b = (const char*)at;
+				for (SIZE_T i = 0; i + (SIZE_T)want < sz; i++)
+				{
+					if (b[i] != g_peekFind[0]) continue;
+					int k = 1;
+					while (k < want && b[i + k] == g_peekFind[k]) k++;
+					if (k == want) { if (!hits) found = i; hits++; }
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+			}
+
+			char line[220];
+			int fn = sprintf(line, "  peek find '%s': %llu hit(s), first at +0x%llX%s",
+			                 g_peekFind, (unsigned long long)hits,
+			                 (unsigned long long)found, "\n");
+			AppendFaultLog(line, (unsigned long)fn);
+		}
+
+		// The first 24 bytes are the CRT's own header, the same whether the block is high or
+		// low. What matters is whether the file's text ever lands in the block, so look for it:
+		// scan the first 64 KB for a run of printable characters.
+		if (!everFilled)
+		{
+			char found[80];
+			found[0] = 0;
+
+			__try
+			{
+				const unsigned char* b = (const unsigned char*)at;
+				const SIZE_T span = (sz < 65536) ? sz : 65536;
+
+				for (SIZE_T i = 0; i + 40 < span; i++)
+				{
+					int run = 0;
+					while (run < 40 && b[i + run] >= 32 && b[i + run] < 127) run++;
+					if (run >= 32)
+					{
+						for (int k = 0; k < 40; k++) found[k] = (char)b[i + k];
+						found[40] = 0;
+						break;
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+			}
+
+			if (found[0])
+			{
+				everFilled = true;
+				char line[220];
+				int fn = sprintf(line, "  peek TEXT IN BUFFER: %s%s", found, "\n");
+				AppendFaultLog(line, (unsigned long)fn);
+			}
+		}
+
+		bool any = false;
+		for (int i = 0; i < 24; i++) if (first[i]) { any = true; break; }
+
+		// The first successful look, whatever it holds - zeroes are the interesting answer here.
+		if (reads == 1)
+		{
+			char line[400];
+			DescribeBytes(any ? "first look" : "first look (EMPTY)", first, line);
+			AppendFaultLog(line, (unsigned long)strlen(line));
+		}
+
+		(void)any;
+
+		// Every four seconds, how much of the whole block is non-zero. Sampled every 64th byte
+		// so 16 MB costs nothing, and it answers the question the first 64 KB cannot: whether
+		// the data landed somewhere else in the buffer or never landed at all.
+		if ((pass % 80) == 0)
+		{
+			SIZE_T nz = 0, seen = 0, readable = 0;
+			__try
+			{
+				const unsigned char* b = (const unsigned char*)at;
+				for (SIZE_T i = 0; i < sz; i += 64)
+				{
+					seen++;
+					if (b[i]) nz++;
+					readable = i;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+			}
+
+			char line[240];
+			int sn = sprintf(line, "  peek fill: %llu of %llu sampled bytes non-zero"
+			                 " (%llu%%), readable up to +0x%llX of 0x%llX%s",
+			                 (unsigned long long)nz, (unsigned long long)seen,
+			                 seen ? (unsigned long long)(nz * 100 / seen) : 0,
+			                 (unsigned long long)readable, (unsigned long long)sz, "\n");
+			AppendFaultLog(line, (unsigned long)sn);
+		}
+	}
+	return 0;
+}
+
+// -readtest - does a file read into high memory work at all?
+//
+// The engine's XML buffer above 4 GB comes back empty while the read reports success. The path
+// is CCryPak::FReadRaw -> CZipPseudoFile::FRead -> CIOWrapper::Fread, which is the CRT's fread.
+// So before reverse-engineering any further: reproduce it standalone. Same CRT, same kind of
+// buffer, same size, one from below the line and one from above, and read a real file into each.
+//
+// If both come back full, the fault is in the engine and the search continues there. If the high
+// one comes back empty, the fault is under the engine entirely - and that changes what the fix
+// has to be.
+static void RunReadTest(void)
+{
+	// Something big enough to be worth reading and certain to exist.
+	const char* candidates[3];
+	candidates[0] = "GameCrysis2/GameData.pak";
+	candidates[1] = "Bin64/CryGameReal.dll";
+	candidates[2] = "Bin64/CrySystem.dll";
+
+	const char* path = 0;
+	for (int i = 0; i < 3 && !path; i++)
+	{
+		FILE* probe = fopen(candidates[i], "rb");
+		if (probe) { fclose(probe); path = candidates[i]; }
+	}
+
+	char line[400];
+	if (!path)
+	{
+		int n = sprintf(line, "  readtest: no test file found%s", "\n");
+		AppendFaultLog(line, (unsigned long)n);
+		return;
+	}
+
+	const SIZE_T want = 16580608;     // the same size the engine asked for
+
+	// Two buffers: one wherever the system puts it, one deliberately above 4 GB.
+	void* low  = VirtualAlloc(NULL, want, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	void* high = 0;
+	for (ULONG_PTR at = 0x300000000ull; at < 0x380000000ull && !high; at += 0x2000000)
+		high = VirtualAlloc((LPVOID)at, want, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+	int n = sprintf(line, "  readtest: file %s, low 0x%llX, high 0x%llX%s", path,
+	                (unsigned long long)(ULONG_PTR)low,
+	                (unsigned long long)(ULONG_PTR)high, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	if (!low || !high) return;
+
+	for (int which = 0; which < 2; which++)
+	{
+		unsigned char* buf = (unsigned char*)(which ? high : low);
+		memset(buf, 0, 4096);
+
+		FILE* f = fopen(path, "rb");
+		if (!f) continue;
+
+		const size_t got = fread(buf, 1, want, f);
+		fclose(f);
+
+		// How much of the first 4 KB is actually non-zero - a read that did nothing leaves the
+		// memset behind.
+		int nonzero = 0;
+		for (int i = 0; i < 4096; i++) if (buf[i]) nonzero++;
+
+		n = sprintf(line, "  readtest %s: fread returned %llu, first 4 KB has %d non-zero byte(s)"
+		            " -> %s%s",
+		            which ? "HIGH" : "low ", (unsigned long long)got, nonzero,
+		            nonzero ? "data arrived" : "NOTHING WAS WRITTEN", "\n");
+		AppendFaultLog(line, (unsigned long)n);
+
+		// And the same through ReadFile, in case the CRT is the difference.
+		memset(buf, 0, 4096);
+		HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		                       FILE_ATTRIBUTE_NORMAL, NULL);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			DWORD read = 0;
+			const BOOL ok = ReadFile(h, buf, (DWORD)want, &read, NULL);
+			CloseHandle(h);
+
+			nonzero = 0;
+			for (int i = 0; i < 4096; i++) if (buf[i]) nonzero++;
+
+			n = sprintf(line, "  readtest %s: ReadFile ok=%d read=%lu, %d non-zero -> %s%s",
+			            which ? "HIGH" : "low ", (int)ok, (unsigned long)read, nonzero,
+			            nonzero ? "data arrived" : "NOTHING WAS WRITTEN", "\n");
+			AppendFaultLog(line, (unsigned long)n);
+		}
+	}
+
+	VirtualFree(low, 0, MEM_RELEASE);
+	VirtualFree(high, 0, MEM_RELEASE);
+}
+
+// -movdump - the state of the cutscene system, read out of the running game.
+//
+// Everything outside CryMovie checked out: the entities are there, the objects are there, the
+// clock runs, the lookups are 64-bit clean. What is left is the sequence itself, which is
+// reachable: gEnv+0xD8 is pMovieSystem, and the leaked CryMovie source gives the shape.
+//
+//   class CMovieSystem : public IMovieSystem
+//       vtable, ISystem*, IMovieUser*, IMovieCallback*, CTimeValue m_lastUpdateTime,
+//       int m_lastGenId, vector<_smart_ptr<IAnimSequence>> m_sequences,
+//       list<PlayingSequence> m_playingSequences, ...
+//
+//   struct PlayingSequence { IAnimSequence* sequence; float start, end, current; bool, bool; }
+//
+// Retail offsets need not match the source exactly, so this prints the raw head of the object
+// rather than trusting a layout: three dumps ten seconds apart say both what differs between a
+// working run and a broken one, and what stands still while the game plays on.
+#define PMOVIE_OFF 0xD8
+
+static bool g_movDump   = false;
+static int  g_movDumped = 0;
+
+static void DumpMovieSystem(int pass)
+{
+	HMODULE gr = GetModuleHandleA("CryGameReal.dll");
+	if (!gr) return;
+
+	ULONG_PTR env = 0;
+	if (!SafePeek((unsigned char*)gr + GENV_RVA_IN_GAMEREAL, &env) || env < 0x10000) return;
+
+	ULONG_PTR mov = 0;
+	if (!SafePeek((unsigned char*)env + PMOVIE_OFF, &mov) || mov < 0x10000) return;
+
+	char line[400];
+	int n = sprintf(line, "  movdump[%d]: CMovieSystem at 0x%llX%s", pass,
+	                (unsigned long long)mov, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+
+	// The sequences themselves. m_sequences sits at +0x30 as a vector of three pointers; the
+	// first element is a CAnimSequence, whose own head carries its node list - and a sequence
+	// with no nodes animates nothing, which is exactly what a cutscene that plays but does not
+	// move would look like.
+	ULONG_PTR vecBegin = 0, vecEnd = 0;
+	if (SafePeek((const void*)(mov + 0x30), &vecBegin) &&
+	    SafePeek((const void*)(mov + 0x38), &vecEnd) && vecBegin && vecEnd > vecBegin)
+	{
+		char sl[220];
+		int sn = sprintf(sl, "  movdump[%d]: %llu sequence(s), vector at 0x%llX%s", pass,
+		                 (unsigned long long)((vecEnd - vecBegin) / 8),
+		                 (unsigned long long)vecBegin, "\n");
+		AppendFaultLog(sl, (unsigned long)sn);
+
+		ULONG_PTR seq = 0;
+		if (SafePeek((const void*)vecBegin, &seq) && seq > 0x10000)
+		{
+			sn = sprintf(sl, "      sequence[0] at 0x%llX%s", (unsigned long long)seq, "\n");
+			AppendFaultLog(sl, (unsigned long)sn);
+
+			for (int so = 0; so < 0x60; so += 8)
+			{
+				ULONG_PTR sv = 0;
+				if (!SafePeek((const void*)(seq + (ULONG_PTR)so), &sv)) break;
+				const float* sf = (const float*)&sv;
+				sn = sprintf(sl, "        seq+0x%02X = 0x%016llX  f(%.3f, %.3f)%s",
+				             so, (unsigned long long)sv, sf[0], sf[1], "\n");
+				AppendFaultLog(sl, (unsigned long)sn);
+			}
+		}
+	}
+
+	// The playing sequences. Not at +0x48 and not a std::list - the retail layout puts them in a
+	// VECTOR at +0xB30, which the Update code gives away: it does (end-begin) and divides by 24,
+	// the size of a PlayingSequence (sequence pointer, then start/end/current time).
+	//
+	// currentTime is the whole question: a cutscene that plays has one that grows, a cutscene
+	// that is stuck has one that stands still. The flowgraph says the sequence was Started and
+	// never reported Done, so this number decides whether it is running at all.
+	// The gate inside the update loop. For a sequence whose flags have bit 8 set (a cutscene),
+	// Update checks one global and skips the sequence when it is non-zero:
+	//
+	//   CryMovie+0xF256  call [rax+0x80]                 GetFlags()
+	//   CryMovie+0xF25C  test al, 8
+	//   CryMovie+0xF25E  je   <update the clock>
+	//   CryMovie+0xF260  cmp  dword ptr [rip+0x63f95], r12d
+	//   CryMovie+0xF267  jne  <skip this sequence>
+	//
+	// rip after that cmp is 0xF267, so the global is at CryMovie+0x731FC. If it is non-zero
+	// while a cutscene is playing, the clock never advances and nothing is logged.
+	{
+		HMODULE cm = GetModuleHandleA("CryMovie.dll");
+		ULONG_PTR gv = 0;
+		if (cm && SafePeek((const unsigned char*)cm + 0x731FC, &gv))
+		{
+			char gl[220];
+			int gn = sprintf(gl, "      cutscene gate: CryMovie+0x731FC = %u (0x%llX)%s",
+			                 (unsigned)(gv & 0xFFFFFFFF), (unsigned long long)gv, "\n");
+			AppendFaultLog(gl, (unsigned long)gn);
+		}
+	}
+
+	// The first thing CMovieSystem::Update does (CryMovie+0xF120) is
+	//     cmp byte ptr [rcx+0x99], 0
+	//     jne <return>
+	// - a flag that makes the whole update a no-op. If it is set while a cutscene is in the
+	// playing list, the sequence sits there with its clock frozen, which is exactly what the
+	// dump shows. So read it.
+	{
+		ULONG_PTR w = 0;
+		unsigned char f99 = 0xFF, f9a = 0xFF, f98 = 0xFF;
+		if (SafePeek((const void*)(mov + 0x98), &w))
+		{
+			const unsigned char* b = (const unsigned char*)&w;
+			f98 = b[0]; f99 = b[1]; f9a = b[2];
+		}
+		char fl[200];
+		int fn = sprintf(fl, "      flags: +0x98=%u  +0x99=%u (update gate)  +0x9A=%u%s",
+		                 f98, f99, f9a, "\n");
+		AppendFaultLog(fl, (unsigned long)fn);
+	}
+
+	// The real place, read off the engine's own code: CMovieSystem::IsPlaying (CryMovie+0xCDE0)
+	// walks [this+0x50] to [this+0x58] with a stride of 0x20 and compares the sequence pointer
+	// with a full 64-bit cmp. So the playing list is a vector at +0x50 of 32-byte entries - not
+	// +0x48, not a std::list, not 24 bytes. Guessing the layout from the leaked headers was
+	// wrong twice; the retail code says it plainly.
+	ULONG_PTR pbegin = 0, pend = 0;
+	if (SafePeek((const void*)(mov + 0x50), &pbegin) &&
+	    SafePeek((const void*)(mov + 0x58), &pend) && pbegin && pend >= pbegin)
+	{
+		const unsigned long long count = (unsigned long long)(pend - pbegin) / 32;
+		char pl[300];
+		int pn = sprintf(pl, "      playing: %llu sequence(s)%s", count, "\n");
+		AppendFaultLog(pl, (unsigned long)pn);
+
+		for (unsigned long long k = 0; k < count && k < 4; k++)
+		{
+			const ULONG_PTR at2 = pbegin + (ULONG_PTR)(k * 32);
+			// Update does: current += dt * [entry+0x14]. That multiplier is the sequence's
+			// speed, and a zero there freezes the clock without any error anywhere - which is
+			// precisely the symptom. Read it alongside the times.
+			ULONG_PTR sp = 0;
+			float tm[4] = { 0, 0, 0, 0 };
+			SafePeek((const void*)at2, &sp);
+			__try { memcpy(tm, (const void*)(at2 + 8), sizeof(tm)); }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			pn = sprintf(pl, "        [%llu] seq=0x%llX start=%.3f end=%.3f CURRENT=%.3f "
+			             "SPEED=%.4f%s",
+			             k, (unsigned long long)sp, tm[0], tm[1], tm[2], tm[3], "\n");
+			AppendFaultLog(pl, (unsigned long)pn);
+		}
+	}
+	else
+	{
+		char pl[120];
+		int pn = sprintf(pl, "      playing: none%s", "\n");
+		AppendFaultLog(pl, (unsigned long)pn);
+	}
+
+	// The head of the object, eight bytes at a time, with a reading of what each word could be.
+	for (int off = 0; off < 0x90; off += 8)
+	{
+		ULONG_PTR v = 0;
+		if (!SafePeek((const void*)(mov + (ULONG_PTR)off), &v)) break;
+
+		// A word can be a pointer, or a pair of floats, or a pair of ints - print all three and
+		// let the comparison between runs pick the one that matters.
+		const float* f = (const float*)&v;
+		const unsigned* u = (const unsigned*)&v;
+
+		n = sprintf(line, "      +0x%02X = 0x%016llX   %s  f(%.3f, %.3f)  i(%u, %u)%s",
+		            off, (unsigned long long)v,
+		            (v > 0x10000 && v < 0x7FFFFFFFFFFFull) ? "ptr" : "   ",
+		            f[0], f[1], u[0], u[1], "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+}
+
+// -bp:RVA[,RVA...] - where does the sequence loading actually stop.
+//
+// CryMovie+0xBE00 is CMovieSystem::Serialize, and the sequences are loaded there:
+//
+//   +0xBE29  call [rax+0x130]     xmlNode->findChild("SequenceData") -> [rsp+0x20]
+//   +0xBE2F  cmp qword [rsp+0x20], 0
+//   +0xBE35  je  ...              node missing: give up silently
+//   +0xBE51  call [rax+0x120]     seqNode->getChildCount() -> eax
+//   +0xBE57  test eax, eax
+//   +0xBE59  jle ...              no children: give up silently
+//
+// Both exits are silent, and the vector ends up untouched, so the dump cannot say which one was
+// taken. A breakpoint can: one 0xCC byte, an exception handler that reports the registers and
+// the stack slot, then the original byte is restored and execution continues. Nothing is
+// detoured and nothing stays patched - the code runs as itself after the first hit.
+#define BP_SLOTS 6
+static ULONG_PTR g_bpAt[BP_SLOTS];
+static unsigned char g_bpOrig[BP_SLOTS];
+static int g_bpHits[BP_SLOTS];      // a call site fires many times; the first few are the story
+static int  g_bpCount = 0;
+static bool g_bpArmed = false;
+static char g_bpModule[40] = "CryMovie.dll";
+
+static LONG CALLBACK BreakpointVeh(EXCEPTION_POINTERS* ep)
+{
+	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_BREAKPOINT)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	const ULONG_PTR pc = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+
+	for (int i = 0; i < g_bpCount; i++)
+	{
+		if (g_bpAt[i] != pc) continue;
+
+		// What the code has in hand at this point. rax/rcx/rdx cover the return value and the
+		// object; the stack slot is where findChild puts the node it found.
+		ULONG_PTR slot20 = 0;
+		SafePeek((const void*)(ep->ContextRecord->Rsp + 0x20), &slot20);
+
+		// CMovieSystem::Update keeps `this` in r14 from its third instruction on, and the list of
+		// playing sequences is the pair at +0x50 / +0x58. The disassembly leaves exactly one
+		// branch that can skip the clock update - `je` on those two being equal, an empty list -
+		// so print the pair next to the object that owns it. Read through gEnv+0xD8 that list has
+		// two entries; if r14 names a different object, that is the whole answer.
+		ULONG_PTR play0 = 0, play1 = 0;
+		SafePeek((const void*)(ep->ContextRecord->R14 + 0x50), &play0);
+		SafePeek((const void*)(ep->ContextRecord->R14 + 0x58), &play1);
+
+		// The other half of the branch at 0xF267: `cmp dword [CryMovie+0x731FC], r12d` with r12d
+		// zeroed at the top of the function. Non-zero here, with flag 8 set on the sequence, and
+		// the cutscene is taken off the playing list instead of having its clock advanced.
+		unsigned glob = 0xFFFFFFFF;
+		{
+			HMODULE mv = GetModuleHandleA(g_bpModule);
+			if (mv)
+			{
+				ULONG_PTR raw = 0;
+				if (SafePeek((const unsigned char*)mv + 0x731FC, &raw))
+					glob = (unsigned)(raw & 0xFFFFFFFFu);
+			}
+		}
+
+		// Who called. At the first instruction of a function [rsp] is the return address, so a
+		// breakpoint on the entry names the caller - which is the whole question when a function
+		// is never reached: the fault is in whoever should have called it.
+		// Walk a little of the interrupted stack and name everything on it that points into a
+		// module's code. The exact return address is not always the first word - the breakpoint
+		// may sit past a push - so print the first few callers and let the shape speak.
+		char who[900];
+		who[0] = 0;
+		int wn = 0;
+		int named = 0;
+		for (int s = 0; s < 64 && named < 7; s++)
+		{
+			ULONG_PTR v = 0;
+			if (!SafePeek((const void*)(ep->ContextRecord->Rsp + (ULONG_PTR)s * 8), &v)) break;
+			if (v < 0x10000) continue;
+
+			HMODULE fm = 0;
+			if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                        (LPCSTR)v, &fm) || !fm) continue;
+
+			// A module address is not enough: vtables and string tables live in modules too, and
+			// they are what turns up first on a stack. Only executable pages can be return
+			// addresses.
+			MEMORY_BASIC_INFORMATION mbi;
+			if (!VirtualQuery((LPCVOID)v, &mbi, sizeof(mbi))) continue;
+			if ((mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+			                    PAGE_EXECUTE_WRITECOPY)) == 0) continue;
+
+			char nm[200];
+			NameCode(v, nm);
+			wn += sprintf(who + wn, "%s%s", named ? " <- " : "", nm);
+			named++;
+		}
+
+		char line[1100];
+		int n = sprintf(line, "  bp hit %s+0x%llX: from %s | r14=0x%llX play +0x50=0x%llX "
+		                "+0x58=0x%llX %s | rbx=0x%llX rax=0x%llX rcx=0x%llX%s",
+		                g_bpModule,
+		                (unsigned long long)(pc - (ULONG_PTR)GetModuleHandleA(g_bpModule)),
+		                who[0] ? who : "?",
+		                (unsigned long long)ep->ContextRecord->R14,
+		                (unsigned long long)play0,
+		                (unsigned long long)play1,
+		                (play0 == play1) ? "EMPTY" : "has entries",
+		                (unsigned long long)ep->ContextRecord->Rbx,
+		                (unsigned long long)ep->ContextRecord->Rax,
+		                (unsigned long long)ep->ContextRecord->Rcx, "\n");
+		AppendFaultLog(line, (unsigned long)n);
+
+		// Put the code back and step over it. Re-arming after a few hits would need single-step;
+		// instead the byte is restored for good once enough calls have been seen, which is all
+		// this question needs.
+		g_bpHits[i]++;
+
+		DWORD old = 0;
+		if (VirtualProtect((LPVOID)pc, 1, PAGE_EXECUTE_READWRITE, &old))
+		{
+			*(unsigned char*)pc = g_bpOrig[i];
+			VirtualProtect((LPVOID)pc, 1, old, &old);
+			FlushInstructionCache(GetCurrentProcess(), (LPCVOID)pc, 1);
+		}
+		ep->ContextRecord->Rip = (DWORD64)pc;
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void ArmBreakpoints(void)
+{
+	HMODULE m = GetModuleHandleA(g_bpModule);
+	if (!m) return;
+
+	// Which file is actually loaded, and what the code around the points really looks like in
+	// memory. A breakpoint is only as good as the address it sits on: bytes read out of the file
+	// on disk mean nothing if the process mapped a different build, or if something patched the
+	// page first. Print both before arming anything.
+	{
+		char path[MAX_PATH];
+		path[0] = 0;
+		GetModuleFileNameA(m, path, MAX_PATH);
+
+		char line[400];
+		int n = sprintf(line, "  bp module: %s at 0x%llX%s", path,
+		                (unsigned long long)(ULONG_PTR)m, "\n");
+		AppendFaultLog(line, (unsigned long)n);
+
+		for (int j = 0; j < g_bpCount; j++)
+		{
+			const unsigned char* q = (const unsigned char*)m + g_bpAt[j];
+			n = sprintf(line, "  bp bytes at +0x%llX:", (unsigned long long)g_bpAt[j]);
+			for (int k = 0; k < 12; k++)
+			{
+				ULONG_PTR one = 0;
+				if (SafePeek(q + k, &one)) n += sprintf(line + n, " %02X", (unsigned)(one & 0xFF));
+				else                       n += sprintf(line + n, " ??");
+			}
+			n += sprintf(line + n, "%s", "\n");
+			AppendFaultLog(line, (unsigned long)n);
+		}
+	}
+
+	for (int i = 0; i < g_bpCount; i++)
+	{
+		const ULONG_PTR at = (ULONG_PTR)m + g_bpAt[i];
+		unsigned char* p = (unsigned char*)at;
+
+		DWORD old = 0;
+		if (!VirtualProtect((LPVOID)at, 1, PAGE_EXECUTE_READWRITE, &old)) continue;
+		g_bpOrig[i] = *p;
+		*p = 0xCC;
+		VirtualProtect((LPVOID)at, 1, old, &old);
+		FlushInstructionCache(GetCurrentProcess(), (LPCVOID)at, 1);
+
+		g_bpAt[i] = at;     // from here on the table holds absolute addresses
+
+		char line[200];
+		int n = sprintf(line, "  bp armed at %s+0x%llX (was 0x%02X)%s", g_bpModule,
+		                (unsigned long long)(at - (ULONG_PTR)m), g_bpOrig[i], "\n");
+		AppendFaultLog(line, (unsigned long)n);
+	}
+	g_bpArmed = true;
+}
+
+// Survive a smart pointer copied from an object that is already gone.
+//
+// The renderer copies a small struct of reference-counted pointers - fields at +0x00, +0x18,
+// +0x08, each with its own AddRef. Across a long campaign one of them can name an object that
+// was released when a level unloaded, and the memory has since been handed out again:
+//
+//   CryRenderD3D11+0x57E53  mov [rbx], rcx        the destination field, written first
+//   CryRenderD3D11+0x57E5B  mov rax, [rcx]        what should be the method table
+//   CryRenderD3D11+0x57E5E  call [rax+8]          AddRef - dies here
+//
+// Seen twice, both times on a level transition, both times at this instruction. Once rax held
+// 0x00001D1800001C9E - two numbers side by side where a method table should be, which is what
+// reused memory looks like. Once the call itself jumped into nothing.
+//
+// The repair is not a guard in front of the call. A guard has to decide, on every single copy,
+// whether a pointer is alive - and a guard that decides wrong is exactly what froze the
+// cutscenes for a week. This waits for the fault to actually happen, then clears the field that
+// was already written and resumes at the next line, leaving the pointer empty rather than dead.
+// Every later use tests it against null first, which the code right below does three times.
+// Nothing is patched, nothing is checked ahead of time, and a run where the object is alive
+// never reaches this code at all.
+static ULONG_PTR g_rndCopyCall = 0;      // CryRenderD3D11+0x57E5E, the failing call
+static ULONG_PTR g_rndCopyNext = 0;      // +0x57E61, the line after it
+static volatile LONG g_rndCopySkipped = 0;
+static bool g_rndFixOff = false;         // -norndfix
+
+static bool WritableQword(void* at)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!at || !VirtualQuery(at, &mbi, sizeof(mbi))) return false;
+	if (mbi.State != MEM_COMMIT) return false;
+	const DWORD w = PAGE_READWRITE | PAGE_WRITECOPY |
+	                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	return (mbi.Protect & w) != 0;
+}
+
+static LONG CALLBACK RenderCopyVEH(EXCEPTION_POINTERS* ep)
+{
+	if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+	if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_ACCESS_VIOLATION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (!g_rndCopyCall) return EXCEPTION_CONTINUE_SEARCH;
+
+	CONTEXT* c = ep->ContextRecord;
+	bool mine = false;
+
+	// Two ways the same object kills the same line: the method table is unreadable, so the call
+	// faults where it stands; or it reads but holds garbage, so the call lands on nothing and
+	// the fault happens elsewhere with our return address still on the stack.
+	if ((ULONG_PTR)c->Rip == g_rndCopyCall)
+	{
+		mine = true;
+	}
+	else
+	{
+		ULONG_PTR ret = 0;
+		if (SafePeek((const void*)c->Rsp, &ret) && ret == g_rndCopyNext)
+		{
+			c->Rsp += 8;          // drop the failed call's return address
+			mine = true;
+		}
+	}
+	if (!mine) return EXCEPTION_CONTINUE_SEARCH;
+
+	// rbx is the destination struct, and its first field already holds the dead pointer.
+	if (WritableQword((void*)c->Rbx)) *(ULONG_PTR*)c->Rbx = 0;
+
+	c->Rip = (DWORD64)g_rndCopyNext;
+	InterlockedIncrement(&g_rndCopySkipped);
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Arm it once the renderer is in, and only if the bytes there are the ones this was written
+// against. Reading the instruction out of the file on disk is not enough - a module can be
+// patched in memory, by us or by anything else, and acting on a stale disassembly cost a week.
+static void ArmRenderCopyFix(void)
+{
+	HMODULE m = GetModuleHandleA("CryRenderD3D11.dll");
+	if (!m) return;
+
+	const unsigned char* at = (const unsigned char*)m + 0x57E5E;
+	unsigned char got[3];
+	for (int i = 0; i < 3; i++)
+	{
+		ULONG_PTR one = 0;
+		if (!SafePeek(at + i, &one)) return;
+		got[i] = (unsigned char)(one & 0xFF);
+	}
+
+	char line[220];
+	int n;
+
+	// FF 50 08 = call qword ptr [rax+8]
+	if (got[0] != 0xFF || got[1] != 0x50 || got[2] != 0x08)
+	{
+		n = sprintf(line, "  rndfix: NOT armed, bytes at +0x57E5E are %02X %02X %02X, expected "
+		            "FF 50 08%s", got[0], got[1], got[2], "\n");
+		AppendFaultLog(line, (unsigned long)n);
+		g_rndCopyCall = 1;          // non-zero and never matched: do not look again
+		return;
+	}
+
+	g_rndCopyCall = (ULONG_PTR)m + 0x57E5E;
+	g_rndCopyNext = (ULONG_PTR)m + 0x57E61;
+	AddVectoredExceptionHandler(1, RenderCopyVEH);
+
+	n = sprintf(line, "  rndfix: armed at CryRenderD3D11+0x57E5E (0x%llX)%s",
+	            (unsigned long long)g_rndCopyCall, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
+
 static volatile LONG g_highSkipped = 0;   // allocations left low on purpose
 
 static LONG TryHighAt(PFN_NtAllocVM orig, HANDLE proc, PVOID* base, SIZE_T* size,
@@ -2653,6 +3901,78 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 		}
 	}
 
+	// -arenamax:N applies to the band whether or not -keepband is on: it is the bisection
+	// coordinate, and it has to be able to override both directions.
+	if (steer && g_arenaMax >= 0 && *size >= 14u * 1024 * 1024 && *size <= 16u * 1024 * 1024)
+	{
+		const LONG nth = InterlockedIncrement(&g_arenaNth);
+		const bool sendUp = (nth >= g_arenaMin) && (nth <= g_arenaMax);
+
+		if (g_arenaWatch && nth == g_arenaWatch)
+		{
+			// ZeroBits is the caller saying how many top bits of the address must be zero - a
+			// way of asking for memory below a line. We pass 0 when we place the block
+			// ourselves, so if this is non-zero we have been overriding an explicit request.
+			char zl[220];
+			int zn = sprintf(zl, "  arena #%ld: zeroBits=%llu type=0x%lX protect=0x%lX%s",
+			                 nth, (unsigned long long)zeroBits, (unsigned long)type,
+			                 (unsigned long)protect, "\n");
+			AppendFaultLog(zl, (unsigned long)zn);
+
+			ReportArena(nth, *size, 0, sendUp ? "going high" : "staying low");
+		}
+
+		if (!sendUp)
+		{
+			InterlockedIncrement(&g_bandKept);
+			const LONG stLow = g_origNtAlloc(proc, base, zeroBits, size, type, protect);
+
+			// Watch it down here too - the same buffer in the configuration that works is the
+			// only thing that says what the one up high should have looked like.
+			if (g_arenaWatch && nth == g_arenaWatch && stLow >= 0 && base && *base)
+			{
+				ReportArena(nth, *size, (ULONG_PTR)*base, "landed low");
+				g_peekBytes = *size;
+				g_peekAt    = (ULONG_PTR)*base;
+			}
+			return stLow;
+		}
+
+		// With the trap armed, the arena goes to an address whose lower 32 bits sit in the
+		// no-access strip. Aimed at one arena rather than all forty, the trap has no background
+		// at all: anything it catches belongs to this allocation.
+		LONG st2;
+		if (g_arenaAtMb)
+		{
+			// A fixed address, so the only variable in the run is height.
+			PVOID at = (PVOID)(ULONG_PTR)(g_arenaAtMb * 1024ull * 1024ull);
+			SIZE_T sz = *size;
+			st2 = g_origNtAlloc(proc, &at, 0, &sz, type | MEM_RESERVE, protect);
+			if (st2 >= 0) { *base = at; *size = sz; }
+		}
+		else
+		{
+			st2 = g_shadowOn
+			    ? TryShadowHigh(g_origNtAlloc, proc, base, size, type, protect)
+			    : TryHighAt(g_origNtAlloc, proc, base, size, type, protect);
+		}
+		if (st2 >= 0)
+		{
+			InterlockedIncrement(&g_topDownCalls);
+			if (g_arenaWatch && nth == g_arenaWatch)
+			{
+				ReportArena(nth, *size, (ULONG_PTR)*base, "landed");
+				// Only publish the address - the watching thread is already running. Starting
+				// one here would be a CreateThread from inside the allocation hook, with the
+				// loader lock held.
+				g_peekBytes = *size;
+				g_peekAt    = (ULONG_PTR)*base;
+			}
+			return st2;
+		}
+		return g_origNtAlloc(proc, base, zeroBits, size, type, protect);
+	}
+
 	// -keepband:LO-HI (in MB): allocations in this size band stay low, whoever asked.
 	//
 	// Bisection landed here: high memory at a 12 MB threshold breaks the game, at 16 MB it is
@@ -2660,9 +3980,35 @@ static LONG __stdcall SteeredNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zeroBit
 	// physics, the animation system, 3DEngine and CrySystem alike. One size from every
 	// subsystem is not a coincidence; that is the allocator's arena, the slab it carves small
 	// blocks out of. So the band can be pinned and everything else can still go high.
+	// -shadow implies the band goes up: keeping it low would leave the trap with nothing to
+	// watch. Stated here rather than at parse time so -keepband keeps its normal meaning.
+	if (steer && g_shadowOn && g_bandLoKb == 0 && *size >= 14u * 1024 * 1024 &&
+	    *size <= 16u * 1024 * 1024)
+	{
+		const LONG sst = TryShadowHigh(g_origNtAlloc, proc, base, size, type, protect);
+		if (sst >= 0)
+		{
+			InterlockedIncrement(&g_topDownCalls);
+			return sst;
+		}
+	}
+
 	if (steer && g_bandLoKb && *size >= (SIZE_T)g_bandLoKb * 1024 &&
 	    *size <= (SIZE_T)g_bandHiKb * 1024)
 	{
+		// With -shadow the band goes up instead, under the trap: the whole point is to have the
+		// arenas high and watched. Everything else is steered exactly as it is today, so the
+		// only difference from the working configuration is the thing being investigated.
+		if (g_shadowOn)
+		{
+			const LONG sst = TryShadowHigh(g_origNtAlloc, proc, base, size, type, protect);
+			if (sst >= 0)
+			{
+				InterlockedIncrement(&g_topDownCalls);
+				return sst;
+			}
+		}
+
 		InterlockedIncrement(&g_bandKept);
 		return g_origNtAlloc(proc, base, zeroBits, size, type, protect);
 	}
@@ -3199,8 +4545,11 @@ static void WatchNewSlabs(unsigned elapsed)
 				if (InterlockedIncrement(&g_slabsLogged) <= 60)
 				{
 					// What is in it. Pixels look like noise, a pool that has not been used yet
-					// is zeros, and engine structures are pointers - which are recognisable on
-					// sight, since every module of this game sits below 4 GB.
+					// is zeros, and engine structures are pointers - recognisable on sight
+					// because this game's MODULES load below 4 GB. Note the word: the modules,
+					// not the memory. Data can and does live above the line once the arenas are
+					// steered up, and a guard that forgot that distinction froze every cutscene
+					// in the game for a week.
 					unsigned long long a0 = 0, a1 = 0, a2 = 0, a3 = 0;
 					unsigned nonzero = 0;
 					{
@@ -3328,6 +4677,99 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 			g_stressGb = keep;
 			RunMemoryStress();
 			g_stressGb = 0;
+		}
+
+		// The hunt is not cheap - a few gigabytes read once - so it runs only with the trap
+		// armed, and only after a level has had time to load and do its work.
+		if (g_shadowOn && elapsed >= 50 && g_huntRuns < 6 && g_huntFound < 40)
+			HuntForTruncatedPointers();
+
+		if (g_bpCount && !g_bpArmed) ArmBreakpoints();
+
+		if (!g_rndFixOff && !g_rndCopyCall) ArmRenderCopyFix();
+
+		// Say when it actually fired. A repair nobody can count is indistinguishable from a
+		// repair that never ran, and "the crash did not happen" is not proof either way - the
+		// crash only showed up once every fourteen levels.
+		{
+			static LONG saidSkips = 0;
+			const LONG now = g_rndCopySkipped;
+			if (now != saidSkips)
+			{
+				saidSkips = now;
+				char rl[200];
+				int rn = sprintf(rl, "  rndfix: caught a dead smart-pointer copy, %ld time(s) "
+				                 "so far%s", (long)now, "\n");
+				AppendFaultLog(rl, (unsigned long)rn);
+			}
+		}
+
+		// Re-arm the points that have not told their story yet: the call happens many times and
+		// the interesting one is not always the first.
+		if (g_bpArmed)
+		{
+			for (int i = 0; i < g_bpCount; i++)
+			{
+				if (g_bpHits[i] == 0 || g_bpHits[i] >= 40) continue;
+				unsigned char* at = (unsigned char*)g_bpAt[i];
+				if (*at == 0xCC) continue;
+				DWORD old = 0;
+				if (VirtualProtect((LPVOID)at, 1, PAGE_EXECUTE_READWRITE, &old))
+				{
+					*at = 0xCC;
+					VirtualProtect((LPVOID)at, 1, old, &old);
+					FlushInstructionCache(GetCurrentProcess(), (LPCVOID)at, 1);
+				}
+			}
+		}
+
+		if (g_movDump && g_movDumped < 10 && elapsed >= 45 + (DWORD)(g_movDumped * 4))
+		{
+			g_movDumped++;
+			DumpMovieSystem(g_movDumped);
+		}
+
+		if (g_pakInfo && !g_saidPak && elapsed >= 45)
+		{
+			HMODULE gr = GetModuleHandleA("CryGameReal.dll");
+			HMODULE cs = GetModuleHandleA("CrySystem.dll");
+			ULONG_PTR env = 0, pak = 0, vt = 0;
+
+			if (gr && cs &&
+			    SafePeek((unsigned char*)gr + GENV_RVA_IN_GAMEREAL, &env) && env > 0x10000 &&
+			    SafePeek((unsigned char*)env + PCRYPAK_OFF, &pak) && pak > 0x10000 &&
+			    SafePeek((const void*)pak, &vt) && vt > 0x10000)
+			{
+				g_saidPak = true;
+				int m = sprintf(line, "  pak: object 0x%llX, vtable 0x%llX (CrySystem+0x%llX)%s",
+				                (unsigned long long)pak, (unsigned long long)vt,
+				                (unsigned long long)(vt - (ULONG_PTR)cs), "\n");
+				AppendFaultLog(line, (unsigned long)m);
+
+				for (int s = 28; s <= 40; s++)
+				{
+					ULONG_PTR fn = 0;
+					if (!SafePeek((const void*)(vt + (ULONG_PTR)s * 8), &fn) || fn < 0x10000)
+						continue;
+					m = sprintf(line, "      slot %2d (+0x%03X) = CrySystem+0x%llX%s%s",
+					            s, s * 8, (unsigned long long)(fn - (ULONG_PTR)cs),
+					            s == 33 ? "   <- FReadRaw" : "", "\n");
+					AppendFaultLog(line, (unsigned long)m);
+				}
+			}
+		}
+
+		// Asking once tells you a value; asking three times tells you whether it is moving.
+		// A sequence that is stuck and a sequence that is playing look identical in a single
+		// sample of the engine's clock.
+		if (g_sayWhat[0] && g_saidTimes < g_sayMax &&
+		    elapsed >= g_sayAfter + (DWORD)(g_saidTimes * g_sayEvery))
+		{
+			g_saidTimes++;
+			const bool ok = RunConsoleCommand(g_sayWhat);
+			int m = sprintf(line, "  say: %s -> %s%s", g_sayWhat,
+			                ok ? "handed to the console" : "console not reachable", "\n");
+			AppendFaultLog(line, (unsigned long)m);
 		}
 
 		if (g_topDown)
@@ -3538,6 +4980,18 @@ static DWORD WINAPI RangeKeeperThread(LPVOID)
 			                (g_topDownLowest == ~0ull) ? 0 : g_topDownLowest,
 			                g_topDownHighest, "\n");
 			AppendFaultLog(line, (unsigned long)m);
+
+			// A trap that caught nothing is a result too: it says the arenas break for some
+			// reason other than a pointer losing its upper half.
+			if (g_shadowOn)
+			{
+				m = sprintf(line, "  shadow: %ld arena(s) placed under the trap, %ld fault(s), "
+				            "%ld distinct site(s), %ld page(s) healed; hunt %ld pass(es), "
+				            "%ld truncated copy(ies)%s",
+				            g_shadowPlaced, g_shadowHits, g_shadowSeenCount,
+				            g_shadowHealed, g_huntRuns, g_huntFound, "\n");
+				AppendFaultLog(line, (unsigned long)m);
+			}
 		}
 		for (int k = 0; k < g_mrTables; k++)
 		{
@@ -5695,6 +7149,91 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
 	CheckGameBuild();
 
+	{
+		const char* am = lpCmdLine ? strstr(lpCmdLine, "-arenamax:") : 0;
+		if (am) g_arenaMax = atoi(am + 10);
+		const char* an = lpCmdLine ? strstr(lpCmdLine, "-arenamin:") : 0;
+		if (an) g_arenaMin = atoi(an + 10);
+		const char* aw = lpCmdLine ? strstr(lpCmdLine, "-arenawatch:") : 0;
+		if (aw) g_arenaWatch = atoi(aw + 12);
+		const char* pf = lpCmdLine ? strstr(lpCmdLine, "-peekfind:") : 0;
+		if (pf)
+		{
+			pf += 10;
+			int k = 0;
+			while (pf[k] && pf[k] != ' ' && pf[k] != 124 && k < 63) { g_peekFind[k] = pf[k]; k++; }
+			g_peekFind[k] = 0;
+		}
+		const char* aa = lpCmdLine ? strstr(lpCmdLine, "-arenaat:") : 0;
+		if (aa) g_arenaAtMb = (unsigned long long)_atoi64(aa + 9);
+
+		if (g_arenaWatch)
+		{
+			DWORD tid = 0;
+			HANDLE th = CreateThread(NULL, 0, PeekThread, NULL, 0, &tid);
+			if (th) CloseHandle(th);
+		}
+	}
+
+	if (lpCmdLine && strstr(lpCmdLine, "-pakinfo")) g_pakInfo = true;
+	if (lpCmdLine && strstr(lpCmdLine, "-movdump")) g_movDump = true;
+
+	if (lpCmdLine && strstr(lpCmdLine, "-bp:"))
+	{
+		const char* at = lpCmdLine;
+		while ((at = strstr(at, "-bp:")) != 0 && g_bpCount < BP_SLOTS)
+		{
+			at += 4;
+			g_bpAt[g_bpCount++] = (ULONG_PTR)strtoul(at, 0, 16);
+			while (*at && *at != ' ') at++;
+		}
+		const char* bm = strstr(lpCmdLine, "-bpmod:");
+		if (bm)
+		{
+			bm += 7;
+			int k = 0;
+			while (bm[k] && bm[k] != ' ' && k < 39) { g_bpModule[k] = bm[k]; k++; }
+			g_bpModule[k] = 0;
+		}
+
+		AddVectoredExceptionHandler(1, BreakpointVeh);
+	}
+	if (lpCmdLine && strstr(lpCmdLine, "-readtest")) RunReadTest();
+
+	// -say:COMMAND[,SECONDS]
+	if (lpCmdLine && strstr(lpCmdLine, "-norndfix")) g_rndFixOff = true;
+
+	if (lpCmdLine && strstr(lpCmdLine, "-sayonce")) g_sayMax = 1;
+
+	if (lpCmdLine && strstr(lpCmdLine, "-sayevery:"))
+	{
+		const int v = atoi(strstr(lpCmdLine, "-sayevery:") + 10);
+		if (v > 0) g_sayEvery = (DWORD)v;
+	}
+
+	if (lpCmdLine && strstr(lpCmdLine, "-sayafter:"))
+		g_sayAfter = (DWORD)atoi(strstr(lpCmdLine, "-sayafter:") + 10);
+
+	if (lpCmdLine && strstr(lpCmdLine, "-say:"))
+	{
+		const char* s = strstr(lpCmdLine, "-say:") + 5;
+		int n = 0;
+		while (s[n] && n < 399) n++;
+		memcpy(g_sayWhat, s, n);
+		g_sayWhat[n] = 0;
+
+		// Trailing flags are not part of the command.
+		for (int i = 0; i < n; i++)
+			if (g_sayWhat[i] == 124) { g_sayWhat[i] = 0; break; }
+
+		// A command line cannot carry spaces through the scripts that drive these runs, so a
+		// tilde stands in for one. Lua needs spaces between keywords, and asking the game a real
+		// question - how many entities did you create, and of what class - takes a whole
+		// statement, not a word.
+		for (int i = 0; g_sayWhat[i]; i++)
+			if (g_sayWhat[i] == 126) g_sayWhat[i] = 32;
+	}
+
 	if (lpCmdLine && strstr(lpCmdLine, "-trace"))
 	{
 		g_trace = true;
@@ -5822,6 +7361,38 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 			                 g_heapHigh ? "on" : "could not resolve kernel32",
 			                 (unsigned)(g_heapHighMin / 1024), "\n");
 			AppendFaultLog(hl, (unsigned long)hn);
+		}
+
+		// -shadow[:MB] - see ReserveShadowStrip. Claimed before the hooks go in, while the low
+		// address space is still empty.
+		if (strstr(lpCmdLine, "-shadow"))
+		{
+			const char* sh = strstr(lpCmdLine, "-shadow:");
+			if (sh)
+			{
+				const unsigned mb = (unsigned)atoi(sh + 8);
+				if (mb >= 32 && mb <= 1024) g_shadowMb = (SIZE_T)mb;
+			}
+			const char* am0 = strstr(lpCmdLine, "-arenamax:");
+			if (am0) g_arenaMax = atoi(am0 + 10);
+			const char* hw = strstr(lpCmdLine, "-hunt:");
+			if (hw)
+			{
+				const unsigned by = (unsigned)atoi(hw + 6);
+				if (by >= 8 && by <= 16 * 1024 * 1024) g_huntWindow = (SIZE_T)by;
+			}
+			g_shadowOn = true;
+			if (strstr(lpCmdLine, "-shadowdry")) g_shadowDry = true;
+			ReserveShadowStrip();
+
+			char sl[200];
+			int sn = g_shadowBase
+			       ? sprintf(sl, "  shadow: trap armed%s, %u MB at 0x%llX-0x%llX%s",
+			                 g_shadowDry ? " (CONTROL RUN, arenas stay low)" : "",
+			                 (unsigned)g_shadowMb, (unsigned long long)g_shadowBase,
+			                 (unsigned long long)g_shadowEnd, "\n")
+			       : sprintf(sl, "  shadow: could not reserve a strip below 2 GB%s", "\n");
+			AppendFaultLog(sl, (unsigned long)sn);
 		}
 
 		g_lowGuardOn = false;                 // asked for explicitly, no need to wait for a wall
@@ -6000,9 +7571,25 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 		HMODULE cryMovie = LoadLibraryA("CryMovie.dll");
 		if (cryMovie) {
 			unsigned char* mb = (unsigned char*)cryMovie;
+			// The module's real bounds, read from its own header. The bounds used to be written
+			// in as 0x34000000..0x34082000, which is where CryMovie happens to land today; a
+			// rebased module would have made every sequence fail the check.
+			unsigned long long mbLo = (unsigned long long)mb;
+			unsigned long long mbHi = mbLo + 0x82000;
+			{
+				const long lfanew = *(const long*)(mb + 0x3C);
+				if (lfanew > 0 && lfanew < 0x1000)
+				{
+					// IMAGE_NT_HEADERS64: signature 4 + file header 20, SizeOfImage at +0x38 of
+					// the optional header.
+					const unsigned long soi = *(const unsigned long*)(mb + lfanew + 24 + 0x38);
+					if (soi > 0x1000 && soi < 0x10000000) mbHi = mbLo + soi;
+				}
+			}
+
 			unsigned long long retNormal = (unsigned long long)(mb + 0xF25C);
 			unsigned long long retSkip   = (unsigned long long)(mb + 0xF2EC);
-			unsigned char* cave = (unsigned char*)VirtualAlloc(NULL, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			unsigned char* cave = (unsigned char*)VirtualAlloc(NULL, 512, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 			if (cave) {
 				int i = 0;
 				// If the vector was reallocated (Animate pushed into it and moved begin), rebase the
@@ -6036,20 +7623,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 				cave[j_first+1]  = (unsigned char)(L_sync - (j_first+2));                           // rel8 -> L_sync
 				cave[j_noreal+1] = (unsigned char)(L_sync - (j_noreal+2));
 				cave[i++]=0x48; cave[i++]=0x8B; cave[i++]=0x0B;                                     // mov rcx,[rbx]  (element pointer)
-				// guard1: is rcx a plausible pointer? All process memory sits below 4 GB, so a value
-				// with non-zero high bits is garbage, and anything below 0x10000 is null or nonsense.
-				cave[i++]=0x49; cave[i++]=0x89; cave[i++]=0xCB;                                     // mov r11,rcx
-				cave[i++]=0x49; cave[i++]=0xC1; cave[i++]=0xEB; cave[i++]=0x20;                      // shr r11,32 (high half)
-				int j_hi = i; cave[i++]=0x75; cave[i++]=0x00;                                       // jnz SKIP (above 4 GB = garbage)
+				// guard1: is rcx a plausible pointer?
+				//
+				// This check used to read "high half non-zero means garbage, since all process
+				// memory sits below 4 GB". That was true of the game it was written against and
+				// false of the one we are building: with the arenas steered high, a sequence
+				// pointer of 0x2_1CF88110 is perfectly valid. The guard threw every one of them
+				// away, took the SKIP path past the clock update, and the cutscene stood still
+				// forever with nothing logged - the symptom this whole hunt was chasing.
+				//
+				// What actually makes a pointer implausible is being null, being tiny, or being
+				// outside the 47-bit range user-mode addresses live in. Check that instead.
 				cave[i++]=0x48; cave[i++]=0x81; cave[i++]=0xF9; cave[i++]=0x00; cave[i++]=0x00; cave[i++]=0x01; cave[i++]=0x00; // cmp rcx,0x10000
 				int j_lo = i; cave[i++]=0x72; cave[i++]=0x00;                                       // jb SKIP (null or small)
+				cave[i++]=0x49; cave[i++]=0xBB; *(unsigned long long*)(cave+i)=0x00007FFFFFFFFFFFull; i+=8; // mov r11,user-mode top
+				cave[i++]=0x4C; cave[i++]=0x39; cave[i++]=0xD9;                                     // cmp rcx,r11
+				int j_hi = i; cave[i++]=0x77; cave[i++]=0x00;                                       // ja SKIP (not an address)
 				cave[i++]=0x48; cave[i++]=0x8B; cave[i++]=0x01;                                     // mov rax,[rcx] (vtable), now safe
-				// guard2: the vtable must lie within CryMovie's exact module bounds, since the nodes
-				// are defined there. Checking only the high byte let garbage through that happened to
-				// share it while pointing past the end of the module.
-				cave[i++]=0x48; cave[i++]=0x3D; *(unsigned int*)(cave+i)=0x34000000; i+=4;          // cmp rax,0x34000000
+				// guard2: the vtable must lie within CryMovie's own bounds, since the nodes are
+				// defined there - compared full-width against the module's real base and size.
+				cave[i++]=0x49; cave[i++]=0xBB; *(unsigned long long*)(cave+i)=mbLo; i+=8;          // mov r11,CryMovie base
+				cave[i++]=0x4C; cave[i++]=0x39; cave[i++]=0xD8;                                     // cmp rax,r11
 				int j_vlo = i; cave[i++]=0x72; cave[i++]=0x00;                                      // jb SKIP (vtable < CryMovie)
-				cave[i++]=0x41; cave[i++]=0xBB; *(unsigned int*)(cave+i)=0x34082000; i+=4;          // mov r11d,0x34082000
+				cave[i++]=0x49; cave[i++]=0xBB; *(unsigned long long*)(cave+i)=mbHi; i+=8;          // mov r11,CryMovie end
 				cave[i++]=0x4C; cave[i++]=0x39; cave[i++]=0xD8;                                     // cmp rax,r11
 				int j_vhi = i; cave[i++]=0x73; cave[i++]=0x00;                                      // jae SKIP (past CryMovie's end)
 				cave[i++]=0xFF; cave[i++]=0x90; cave[i++]=0x80; cave[i++]=0x00; cave[i++]=0x00; cave[i++]=0x00; // call [rax+0x80]

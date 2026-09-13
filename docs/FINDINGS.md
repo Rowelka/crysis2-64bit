@@ -218,3 +218,34 @@ error in between. So the decoder runs to completion and the engine believes the 
 Whether anything was actually visible on screen is the part that still needs a pair of eyes -
 that distinction matters, because "no picture" and "no playback" have completely different causes
 and only the second one is what everybody assumed was happening.
+
+## The disassembly lied, because the bytes in memory were not the bytes on disk
+
+A cutscene would start and never advance: present in the playing list, correct length, speed 1.0,
+clock frozen at zero. No crash, no log line. Four days went into reverse-engineering
+`CMovieSystem` - reading `CryMovie.dll` off disk, mapping the update loop, finding the exact
+instruction that advances the clock, proving it was reached 28 times in a working run and 0 times
+in a broken one.
+
+All of that was correct, and all of it was looking at the wrong code. The process was executing
+something else at that address: a trampoline this launcher itself had installed, from a much
+earlier workaround. On disk the instruction is `48 8B 0B`. In memory it was `48 B8 ... FF E0` - an
+absolute jump into our own code cave, whose first check rejected every pointer with a non-zero
+high half.
+
+What finally exposed it was cheap. Arming a breakpoint prints the byte it replaced, and it printed
+`was 0x00` where the file has `0x48`. One number, and four days of work reinterpreted themselves.
+
+**Before reverse-engineering any function in a running process, dump the bytes at that address
+from memory and compare them with the file.** Twelve bytes is enough. Anything can patch a page -
+an anti-cheat, an overlay, another mod, or, as here, your own code from six weeks ago.
+
+The second half of the lesson is about the guard itself. Its comment read: *"All process memory
+sits below 4 GB, so a value with non-zero high bits is garbage."* True of the game it was written
+against, false of the game it ended up running in. A guard that silently discards what it does not
+recognise will not crash and will not log - it will quietly do nothing, which is the most
+expensive failure mode there is.
+
+When a repair must decide whether a pointer is alive, prefer acting on the fault over guarding
+every call. A handler that runs only when something actually went wrong cannot produce false
+positives; a guard that runs on every call can, and eventually will.

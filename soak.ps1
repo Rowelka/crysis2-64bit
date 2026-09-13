@@ -1,4 +1,4 @@
-﻿# Plays the campaign without a human and says what happened.
+# Plays the campaign without a human and says what happened.
 #
 # Catching crashes by hand costs an evening per crash: the game has to be played until it dies,
 # and the interesting ones only show up after an hour. This runs the levels on its own, moves the
@@ -16,12 +16,39 @@ param(
     [switch]$Move,                            # drive the player: walk, look, shoot
                                               # (off by default - the run must not steal the
                                               #  keyboard, mouse or focus while someone plays)
-    [switch]$KeepGoing                        # do not stop the whole soak on the first crash
+    [switch]$KeepGoing,                       # do not stop the whole soak on the first crash
+    [string]$Game     = ""                    # Crysis 2 folder (auto-detected if omitted)
 )
+# Where the game is. These scripts live next to the launcher source, which sits inside a Crysis 2
+# installation, so the folder is found by walking up until Bin64\CrySystem.dll appears.
+# Pass -Game to point somewhere else.
+function Find-GameFolder([string]$Explicit) {
+    if ($Explicit) { return $Explicit }
+
+    # Two markers, not one: Bin64\CrySystem.dll alone also matches the Mod SDK, which sits
+    # next to the game in a typical modding setup and would be picked instead. GameCrysis2
+    # is what makes it the game. Each level up is checked together with its subfolders,
+    # because these scripts usually live in a sibling folder rather than inside the game.
+    function Test-GameFolder([string]$p) {
+        return (Test-Path (Join-Path $p "Bin64\CrySystem.dll")) -and
+               (Test-Path (Join-Path $p "GameCrysis2"))
+    }
+
+    $d = Split-Path -Parent $PSCommandPath
+    while ($d) {
+        if (Test-GameFolder $d) { return $d }
+        foreach ($s in Get-ChildItem -Path $d -Directory -ErrorAction SilentlyContinue) {
+            if (Test-GameFolder $s.FullName) { return $s.FullName }
+        }
+        $d = Split-Path -Parent $d
+    }
+    throw "Crysis 2 folder not found. Pass -Game ""C:\path\to\Crysis 2""."
+}
+
 
 $ErrorActionPreference = "Stop"
 
-$game = "D:\GAMES\Crysis 2 mod\Crysis 2"
+$game = Find-GameFolder $Game
 $exe  = Join-Path $game "Bin64\launcher64.exe"
 $logs = Join-Path $game "launcher_logs"
 if (-not (Test-Path $exe)) { throw "launcher64.exe not found at $exe" }

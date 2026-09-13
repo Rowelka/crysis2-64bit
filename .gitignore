@@ -20,6 +20,9 @@
 !build.ps1
 !test.ps1
 !soak.ps1
+!play.ps1
+!cutscene_probe.ps1
+!level_switch.ps1
 !memmap.ps1
 !bigpools.cfg
 !extract_resources.py
