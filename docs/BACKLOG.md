@@ -78,6 +78,24 @@ worth reading before writing our own.
 
 ## Open from our own testing
 
+### Props that block you but never render
+
+Found during a fourteen-level campaign run with memory steered high. In a few specific places -
+the AA-gun area on Bryant Park, parts of Prism2 - objects are present as far as the game is
+concerned: they have collision, you walk into them, they take part in the level's logic. Their
+geometry never arrives. The rest of the level around them loads normally, and walking away and
+back does not fix it.
+
+Two things make this worth chasing rather than filing under "missing content":
+
+- it is the same failure seen from the other side as the cutscene bug: engine state intact,
+  something silently not delivered, nothing logged;
+- the same spots misbehave repeatedly, so it is not a random streaming hiccup.
+
+The rendering side and the physics side of an object load through different paths, and only one
+of them fails. That is the first thing to instrument: whether the mesh request is made at all,
+and what comes back when it is.
+
 ### Weapon effects stop appearing
 
 Muzzle flashes and tracers show for the first couple of shots and then stop, both for the player
