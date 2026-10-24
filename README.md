@@ -24,7 +24,7 @@ Three things, and two of them are downloads.
 |---|---|
 | **Crysis 2**, patched to **1.9** | Maximum Edition and the Steam release are already 1.9. A disc copy normally needs the patch. |
 | **Crysis 2 Mod SDK** (free, by Crytek) | [archive.org](https://archive.org/details/Crysis2ModSDK1.0) - 1.4 GB, the file carries Crytek's own signature. Also on [ModDB](https://www.moddb.com/downloads/crysis-2-sdk). |
-| **`launcher64.exe`** | The [Releases](https://github.com/Rowelka/crysis2-64bit/releases) page here. One file, about 50 KB. |
+| **`launcher64.exe`** | The [Releases](https://github.com/Rowelka/crysis2-64bit/releases) page here. One file, about 340 KB. |
 
 The Mod SDK is not optional and it is not a nice-to-have: **the 64-bit engine lives inside it**.
 Retail Crysis 2 ships a 32-bit game only, so without the SDK there is nothing on your disk for
@@ -85,7 +85,7 @@ your machine and not on mine" into something answerable:
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
 | `-noaifix` | let the AI call into a destroyed target, as the game does |
 | `-nosndfix` | let the sound engine call into a destroyed object, as the game does |
-| `-nomodfix` | leave the other modules' copies of the allocator truncating, as the game ships them |
+| `-nomodfix` | leave the other modules' copies of the allocator and the mesh-collision code truncating, as the game ships them |
 | `-topdown[:KB]` | serve large reservations from above the 4 GB line, so truncation faults on demand |
 | `-topdown:max` | put them at the very top of the address space instead (breaks dsound) |
 | `-arenahigh` | serve the allocator's arenas from above the 4 GB line, to exercise the corrections |
@@ -330,7 +330,7 @@ Command line flags:
 | `-nocbfix` | leave the renderer's constant-buffer cache at its original size |
 | `-noaifix` | let the AI call into a destroyed target |
 | `-nosndfix` | let the sound engine call into a destroyed object |
-| `-nomodfix` | leave the truncating stores in every module's copy of the allocator alone |
+| `-nomodfix` | leave the truncating stores in every module's copy of the allocator, and in CryPhysics mesh collisions, alone |
 | `-topdown[:KB]` | serve large reservations from above the 4 GB line |
 | `-arenahigh` | serve allocator arenas from above the 4 GB line |
 
@@ -523,6 +523,42 @@ kernel for the display driver, and their address is not ours to choose.
 
 So the honest figure is not "30 percent of memory is high". It is: of the memory the engine asks
 for itself, what stays below 4 GB is five megabytes.
+
+### One more truncation, in mesh collisions
+
+The allocator corrections were found one crash at a time. To find what had not crashed yet,
+every module was audited for each shape the truncation has taken so far: a pointer global
+written 32 bits wide and read 64, a pointer field read or written 4 bytes wide, a pointer passed
+through a 32-bit register. All of them came back as already corrected, except one.
+
+`CTriMesh::RegisterIntersection` in `CryPhysics.dll` runs when two meshes collide. It picks the
+primitive that was hit out of a list and adds its offset to the list's address, and that
+address goes through a 32-bit register on the way:
+
+```
+RVA 0x1F48E6   mov eax, r15d             ->  mov rax, r15
+RVA 0x1F4902   mov eax, [rsp+0xB0]       ->  add rcx, [rsp+0xB0]
+               add rcx, rax                  (same length, padded with a nop)
+```
+
+The list is sometimes the module's own buffer, which is always low, and sometimes a heap block
+or a triangle on the stack. With memory above the 4 GB line those two cases point into nothing.
+Both sites were run in an emulator over a memory snapshot of the running game - an input of
+`0x7FF5123450C0` came out as `0x123450C0` before the change and whole after it - and then in
+play: 45 minutes with `-topdown` on the Road Rage level, hundreds of explosions throwing debris
+across the map, no fault.
+
+The correction is applied when `CryPhysics.dll` is mapped, before any of its code runs, and only
+if both sites match byte for byte. Memory is not placed above the line until it has taken, the
+same rule as for the allocator copies. `-nomodfix` turns it off with the rest.
+
+### Pools sized for a console
+
+Some engine pools are sized for a 2011 console, and the 64-bit build inherited the numbers. The
+one a player sees is the particle emitter pool: in a heavy fight it runs out and new explosion
+effects simply do not appear. `e_ParticleMemory` in the console shows it as
+`Emitter heap: ... 0 KB free heap`. `bigpools.cfg` has larger values; the two particle pools only
+take effect from `system.cfg`, because they are allocated once when the 3D engine starts.
 
 ## Testing without playing
 

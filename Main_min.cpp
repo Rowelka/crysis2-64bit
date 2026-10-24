@@ -5529,6 +5529,81 @@ static const struct { const char* name; const WidenSite* sites; unsigned count; 
 static volatile LONG g_widened[3] = { 0, 0, 0 };   // an attempt was made
 static volatile LONG g_widenOk[3]  = { 0, 0, 0 };   // every site in the module took
 static volatile LONG g_luaOk       = 0;
+static volatile LONG g_triOk       = 0;
+
+// CryPhysics, CTriMesh::RegisterIntersection - not an allocator this time, but the same loss.
+//
+// When two meshes collide, the function picks the primitive that was hit out of a list and
+// adds its offset to the list's address - but the address goes through a 32-bit register on the
+// way, so only its lower half is kept. The list is either the module's own buffer (low,
+// harmless), a heap allocation, or a triangle on the stack. With memory above the 4 GB line the
+// last two point into nothing.
+//
+// Both sites were run in an emulator over a memory snapshot of the running game: before, an
+// input of 0x7FF5123450C0 came out as 0x123450C0; after, whole. rax is dead after either store.
+//
+//   0x1F48E6  41 8B C7                    mov eax, r15d           -> 49 8B C7   mov rax, r15
+//   0x1F4902  8B 84 24 B0 00 00 00        mov eax, [rsp+0xB0]
+//             48 03 C8                    add rcx, rax            -> 48 03 8C 24 B0 00 00 00
+//                                                                    add rcx, [rsp+0xB0]; 66 90
+// The second one fits in place: [rsp+0xB0] holds a whole pointer (it is written back as a
+// qword three instructions later), so the add can take it straight from memory.
+struct TriSite
+{
+	unsigned             rva;
+	const unsigned char* before;
+	const unsigned char* after;
+	unsigned             len;
+};
+
+static const unsigned char kTri0Before[] = { 0x41, 0x8B, 0xC7 };
+static const unsigned char kTri0After[]  = { 0x49, 0x8B, 0xC7 };
+static const unsigned char kTri1Before[] = { 0x8B, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x48, 0x03, 0xC8 };
+static const unsigned char kTri1After[]  = { 0x48, 0x03, 0x8C, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x66, 0x90 };
+
+static const TriSite kTriSites[] = {
+	{ 0x1F48E6, kTri0Before, kTri0After, sizeof(kTri0Before) },
+	{ 0x1F4902, kTri1Before, kTri1After, sizeof(kTri1Before) },
+};
+
+static volatile LONG g_triPatched = 0;
+
+static void PatchTriMeshOnce(void)
+{
+	if (InterlockedCompareExchange(&g_triPatched, 1, 0) != 0) return;
+
+	unsigned char* base = (unsigned char*)GetModuleHandleA("CryPhysics.dll");
+	if (!base) { g_triPatched = 0; return; }
+
+	// Check every site before touching any: one of two applied is a function that is half
+	// 64-bit, and a different build of the module must be left exactly as it came.
+	const unsigned count = sizeof(kTriSites) / sizeof(kTriSites[0]);
+	unsigned done = 0, already = 0;
+	const char* why = 0;
+	for (unsigned i = 0; i < count && !why; i++)
+	{
+		const TriSite* s = &kTriSites[i];
+		if (memcmp(base + s->rva, s->after, s->len) == 0) already++;
+		else if (memcmp(base + s->rva, s->before, s->len) != 0) why = "no match";
+	}
+	for (unsigned i = 0; i < count && !why; i++)
+	{
+		const TriSite* s = &kTriSites[i];
+		unsigned char* at = base + s->rva;
+		if (memcmp(at, s->after, s->len) == 0) continue;
+		if (!WriteBytes(at, s->after, s->len)) why = "write failed";
+		else if (memcmp(at, s->after, s->len) != 0) why = "write did not stick";
+		else done++;
+	}
+
+	if (!why) InterlockedExchange(&g_triOk, 1);
+
+	char line[160];
+	int n;
+	if (why) n = sprintf(line, "  modfix: CryPhysics.dll trimesh: %u of %u (%s)%s", done, count, why, "\n");
+	else     n = sprintf(line, "  modfix: CryPhysics.dll trimesh: all %u widened%s", count, "\n");
+	AppendFaultLog(line, (unsigned long)n);
+}
 
 // Is the copy inside this module actually in use, and is the correction holding?
 //
@@ -5564,6 +5639,9 @@ static const char* WhyNotSafeForHighMemory(void)
 
 	if (GetModuleHandleA("CryScriptSystem.dll") && !g_luaOk)
 		return "CryScriptSystem.dll";
+
+	if (GetModuleHandleA("CryPhysics.dll") && !g_triOk)
+		return "CryPhysics.dll (trimesh)";
 
 	return 0;
 }
@@ -5703,6 +5781,9 @@ static VOID CALLBACK OnModuleLoaded(ULONG reason, const LDR_NOTIFICATION_DATA* d
 		if (_stricmp(name, kWidenWork[i].name) == 0) WidenIfNeeded(i);
 
 	if (_stricmp(name, "CryScriptSystem.dll") == 0) WidenLuaOnce();
+
+	// Mapped but not yet initialised: nothing in the module can be running these bytes.
+	if (_stricmp(name, "CryPhysics.dll") == 0) PatchTriMeshOnce();
 }
 
 static bool RegisterLoaderNotification(void)
@@ -5733,6 +5814,7 @@ static DWORD WINAPI ModuleFixThread(LPVOID)
 		for (int i = 0; i < 3; i++)
 			if (!g_widened[i] && GetModuleHandleA(kWidenWork[i].name)) WidenIfNeeded(i);
 		if (!g_luaWidened && GetModuleHandleA("CryScriptSystem.dll")) WidenLuaOnce();
+		if (!g_triPatched && GetModuleHandleA("CryPhysics.dll")) PatchTriMeshOnce();
 		if (early && g_widened[0] && g_widened[1]) break;
 		Sleep(5);
 	}
